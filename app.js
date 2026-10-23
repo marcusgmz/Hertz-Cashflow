@@ -13,7 +13,7 @@ const state = {
   uc: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Unreleased Checks
   po: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Projected Cash Outflow   // Disposal Schedule (Proceeds from Disposal)   // Cash Flow Report (Retail trend)
 };
-// Opening cash balances (beginning balance of Week 1) — typed in Setup each Friday. USD amounts are converted at 62.50 PHP per USD.
+// Opening cash balances (beginning balance of Week 1). USD amounts are converted at 62.50 PHP per USD.
 const USD_RATE = 62.5;
 const accounts = [
   { bank: "LDB", no: "", purpose: "", bal: 0 },
@@ -97,7 +97,7 @@ const HAS_FS = "showDirectoryPicker" in window;
 // why folder access may be unavailable (shown to the user instead of a dead button)
 function fsUnavailableReason() {
   if (HAS_FS) return "";
-  if (!window.isSecureContext) return `This page was opened as ${location.protocol}//${location.host || ""} — browsers turn off folder access on plain "http" addresses. Open the system from its file path instead (e.g. Z:\\Hertz\\V3.4\\index.html or \\\\SERVER\\Hertz\\V3.4\\index.html), or use https.`;
+  if (!window.isSecureContext) return `This page was opened as ${location.protocol}//${location.host || ""} — browsers turn off folder access on plain "http" addresses. Open the system from its file path instead (e.g. Z:\\Hertz\\V3.5\\index.html or \\\\SERVER\\Hertz\\V3.5\\index.html), or use https.`;
   return "This browser cannot save into folders. Use Google Chrome or Microsoft Edge (up to date).";
 }
 
@@ -258,14 +258,14 @@ function parseCashflowReport(wb) {
   if (hi < 0) throw new Error('Could not find the "Date" and "Actual Retail Collection" headings on the Summary sheet.');
   const h = grid[hi].map((c) => (typeof c === "string" ? c.trim().toLowerCase() : ""));
   const iDate = h.findIndex((x) => x === "date"), iAct = h.findIndex((x) => /actual\s*retail/.test(x)), iProj = h.findIndex((x) => /projected\s*retail/.test(x));
-  const rows = [];
-  for (const r of grid.slice(hi + 1)) {
+  const o = XLSX.utils.decode_range(wb.Sheets[name]["!ref"] || "A1").s, rows = [];
+  grid.slice(hi + 1).forEach((r, j) => {
     const d = parseDate(r[iDate]);
-    if (!d) continue;
+    if (!d) return;
     const a = r[iAct], p = iProj >= 0 ? r[iProj] : null;
-    rows.push({ date: new Date(d.getFullYear(), d.getMonth(), d.getDate()), actual: typeof a === "number" ? a : null, projected: typeof p === "number" ? p : null });
-  }
-  return { rows, sheet: name, col: XLSX.utils.encode_col(iAct) };
+    rows.push({ date: new Date(d.getFullYear(), d.getMonth(), d.getDate()), actual: typeof a === "number" ? a : null, projected: typeof p === "number" ? p : null, r: o.r + hi + 1 + j });
+  });
+  return { rows, sheet: name, col: XLSX.utils.encode_col(o.c + iAct), hdr: o.r + hi, cAct: o.c + iAct };
 }
 
 function handleCashflowReport(file) {
@@ -484,15 +484,15 @@ function parseUnitDisposals(wb) {
     const rFrom = g.findIndex((r) => t(r[0], /^from$/i)), rTo = g.findIndex((r) => t(r[0], /^to$/i));
     const rAmt = g.findIndex((r) => t(r[0], /^disposal proceeds$/i)), rUnits = g.findIndex((r) => t(r[0], /^units\b.*cash received/i));
     if (rFrom < 0 || rTo < 0 || rAmt < 0) continue;
-    const rows = [];
+    const o = XLSX.utils.decode_range(wb.Sheets[name]["!ref"] || "A1").s, rows = [];
     for (let col = 1; col < g[rFrom].length; col++) {
       const f = parseDate(g[rFrom][col]), to = parseDate(g[rTo][col]);
       if (!f || !to) continue;                                  // the Total column has no dates
       const amount = typeof g[rAmt][col] === "number" ? g[rAmt][col] : 0;
       const units = rUnits >= 0 && typeof g[rUnits][col] === "number" ? g[rUnits][col] : null;
-      rows.push({ from: f, to, amount, units, monday: mostDaysMonday(f, to) });
+      rows.push({ from: f, to, amount, units, monday: mostDaysMonday(f, to), c: o.c + col });
     }
-    if (rows.length) return { rows, sheet: name };
+    if (rows.length) return { rows, sheet: name, amtRow: o.r + rAmt };
   }
   throw new Error('No "Disposal proceeds" row with From / To week rows (Weekly Cash Flow sheet of the Unit Disposals file).');
 }
@@ -558,13 +558,15 @@ function parseLoans(wb) {
     const hi = g.slice(0, 20).findIndex((r) => r.some((c) => isTxt(c, /^due date$/i)) && r.some((c) => isTxt(c, /^net amount$/i)));
     if (hi < 0) continue;
     const iD = g[hi].findIndex((c) => isTxt(c, /^due date$/i)), iA = g[hi].findIndex((c) => isTxt(c, /^net amount$/i));
+    const o = XLSX.utils.decode_range(wb.Sheets[name]["!ref"] || "A1").s, lines = [];
     const byDate = {}; let n = 0, total = 0;
-    for (const r of g.slice(hi + 1)) {
+    g.slice(hi + 1).forEach((r, j) => {
       const d = parseDate(r[iD]), a = r[iA];
-      if (!d || typeof a !== "number") continue;
+      if (!d || typeof a !== "number") return;
       const k = toISO(d); byDate[k] = (byDate[k] || 0) + a; n++; total += a;
-    }
-    if (n) return { byDate, n, total, what: "payments" };
+      lines.push({ r: o.r + hi + 1 + j, date: d });
+    });
+    if (n) return { byDate, n, total, what: "payments", loc: { sheet: name, hdr: o.r + hi, cAmt: o.c + iA, lines } };
   }
   throw new Error('No sheet with "Due date" and "Net amount" headings.');
 }
@@ -575,15 +577,17 @@ function parseChecks(wb) {
     const hi = g.slice(0, 20).findIndex((r) => r.some((c) => isTxt(c, /date cleared/i)) && r.some((c) => isTxt(c, /^net amount$/i)));
     if (hi < 0) continue;
     const iD = g[hi].findIndex((c) => isTxt(c, /date cleared/i)), iA = g[hi].findIndex((c) => isTxt(c, /^net amount$/i));
+    const o = XLSX.utils.decode_range(wb.Sheets[name]["!ref"] || "A1").s, lines = [];
     const byDate = {}; let n = 0, total = 0, undated = 0;
-    for (const r of g.slice(hi + 1)) {
+    g.slice(hi + 1).forEach((r, j) => {
       const a = r[iA];
-      if (typeof a !== "number") continue;
+      if (typeof a !== "number") return;
       const d = parseDate(r[iD]);
-      if (!d) { undated += a; continue; }
+      lines.push({ r: o.r + hi + 1 + j, date: d });
+      if (!d) { undated += a; return; }
       const k = toISO(d); byDate[k] = (byDate[k] || 0) + a; n++; total += a;
-    }
-    if (n) return { byDate, n, total, undated, what: "checks" };
+    });
+    if (n) return { byDate, n, total, undated, what: "checks", loc: { sheet: name, hdr: o.r + hi, cAmt: o.c + iA, lines } };
   }
   throw new Error('No sheet with "NET AMOUNT" and "Date Cleared" headings.');
 }
@@ -595,6 +599,7 @@ function parseProjected(wb) {
     const rFrom = g.findIndex((r) => isTxt(r[0], /^from$/i)), rTo = g.findIndex((r) => isTxt(r[0], /^to$/i));
     if (rFrom < 0 || rTo < 0) continue;
     const rTot = g.findIndex((r, i) => i > rTo && isTxt(r[0], /^total$/i));
+    const o = XLSX.utils.decode_range(wb.Sheets[name]["!ref"] || "A1").s, cols = [];
     const byDate = {}; let n = 0, total = 0;
     for (let col = 1; col < g[rFrom].length; col++) {
       const f = parseDate(g[rFrom][col]), t = parseDate(g[rTo][col]);
@@ -606,8 +611,9 @@ function parseProjected(wb) {
       for (let d = new Date(f.getFullYear(), f.getMonth(), f.getDate()); d <= t; d = addDays(d, 1)) { const m = toISO(mondayOf(d)); days[m] = (days[m] || 0) + 1; }
       const target = Object.entries(days).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0][0];
       byDate[target] = (byDate[target] || 0) + amt; n++; total += amt;
+      cols.push({ c: o.c + col, monday: new Date(target + "T00:00:00"), amt });
     }
-    if (n) return { byDate, n, total, what: "weekly columns" };
+    if (n) return { byDate, n, total, what: "weekly columns", loc: { sheet: name, totRow: rTot >= 0 ? o.r + rTot : -1, cols } };
   }
   throw new Error('No sheet with "From" / "To" week rows.');
 }
@@ -776,7 +782,7 @@ function extractItems(kind) {
     if (!due) undated++;
     items.push({
       party: party == null || party === "" ? "(unnamed)" : String(party).trim(),
-      due, amount,
+      due, amount, row: r.__r,
       type: map.type >= 0 && r[map.type] != null ? String(r[map.type]) : "",
       vat: map.vat >= 0 && r[map.vat] != null ? String(r[map.vat]) : "",
       inv: map.inv >= 0 && r[map.inv] != null ? String(r[map.inv]) : "",
@@ -820,10 +826,12 @@ function computeAR(items, start, weeks, rules) {
   const WEEK = 7 * DAY;
   for (const it of items) {
     const tk = typeKind(it.type);
-    let ewt = 0;
+    let ewt = 0, ewtRate = 0;
+    const nonVat = normType(it.vat) === "non vat";
     if (rules.ewt.on && !rules.exempt.has(it.party.toLowerCase())) {
-      const base = normType(it.vat) === "non vat" ? it.amount : it.amount / (1 + rules.ewt.vat);
-      ewt = base * (tk.rental ? rules.ewt.rental : rules.ewt.other);
+      const base = nonVat ? it.amount : it.amount / (1 + rules.ewt.vat);
+      ewtRate = tk.rental ? rules.ewt.rental : rules.ewt.other;
+      ewt = base * ewtRate;
     }
     const cash = it.amount - ewt;
     out.count++; out.gross += it.amount; out.ewt += ewt; out.cash += cash; out.mix[tk.kind] += cash;
@@ -858,7 +866,7 @@ function computeAR(items, start, weeks, rules) {
       if (week != null) { slot = week > weeks ? "later" : week - 1; if (slot === "later") why += ` — after Week ${weeks}, not in the forecast`; }
     }
     if (typeof slot === "number") weekly[slot] += cash; else out[slot] += cash;
-    out.lines.push({ party: it.party, inv: it.inv, type: it.type, due: it.due, dpd, amount: it.amount, ewt, cash, slot, why, proj: it.proj, projDash: it.projDash, rem: it.rem });
+    out.lines.push({ party: it.party, inv: it.inv, type: it.type, due: it.due, dpd, amount: it.amount, ewt, cash, slot, why, proj: it.proj, projDash: it.projDash, rem: it.rem, row: it.row, ewtRate, nonVat });
 
     if (!out.byParty.has(it.party)) out.byParty.set(it.party, { weekly: Array(weeks).fill(0), rule: 0, later: 0, nodue: 0, dash: 0 });
     const p = out.byParty.get(it.party);
@@ -1308,7 +1316,9 @@ async function loadLatestSummary() {
     const latest = names.pop();
     if (latest) {
       const f = await (await dir.getFileHandle(latest)).getFile();
-      const wb = XLSX.read(await f.arrayBuffer(), { type: "array" });
+      const ab = await f.arrayBuffer();
+      let wb = XLSX.read(ab, { type: "array", bookProps: true });
+      if (!/cashflow-sig:/.test((wb.Props && wb.Props.Comments) || "")) wb = XLSX.read(ab, { type: "array", sheets: ["Meta"] });   // older summaries
       const m = /cashflow-sig:(\S+)/.exec((wb.Props && wb.Props.Comments) || "");
       const meta = wb.Sheets["Meta"];
       lastSaved = { name: latest, sig: m ? m[1] : meta && meta.B1 ? String(meta.B1.v) : null };
@@ -1413,6 +1423,229 @@ function applyCashOutState(co, fileName) {
   return used;
 }
 
+/* ============================================================
+   Detail sheets of the saved summary: a copy of each source sheet as uploaded (formatting kept), with columns
+   (or a row, for week-across layouts) added at the right end / bottom: the Summary week of each line, and for
+   AR the EWT and net cash. The Summary amounts are formulas (SUMIFS) that point to those added cells.
+   ============================================================ */
+const qs = (n) => `'${n.replace(/'/g, "''")}'`;
+const ADD_HEAD = { font: { name: "Calibri", size: 11, bold: true, color: { argb: "FF1F4E79" } }, fill: { type: "pattern", pattern: "solid", fgColor: { argb: "FFDDEBF7" } } };
+const ADD_CELL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF2F7FC" } };
+const SLOT_TXT = { nodue: "Not in forecast (no due date)", dash: 'Not in forecast ("-")', rule: "Not in forecast (overdue rule)", later: "After the last forecast week" };
+
+function addHead(ws, r, c, text, width) {
+  const x = ws.getCell(r, c);
+  x.value = text; x.font = ADD_HEAD.font; x.fill = ADD_HEAD.fill; x.alignment = { wrapText: true, vertical: "middle" };
+  if (width) ws.getColumn(c).width = width;
+}
+function addCell(ws, r, c, value, fmt) {
+  const x = ws.getCell(r, c);
+  x.value = value instanceof Date ? xlDate(value) : value; x.fill = ADD_CELL;
+  x.numFmt = fmt || (value instanceof Date ? "mm/dd/yyyy" : typeof value === "number" || (value && value.formula) ? XL_NUM : "General");
+  return x;
+}
+// value of a copied cell: formulas that point to other sheets / files keep their last value
+function copyValue(cell) {
+  const v = cell.value;
+  if (v && typeof v === "object" && ("formula" in v || "sharedFormula" in v)) {
+    let f = null; try { f = cell.formula; } catch (_) {}
+    const res = v.result === undefined ? null : v.result;
+    return !f || /!|\[/.test(f) ? res : { formula: f, result: v.result };
+  }
+  return v;
+}
+function copySheet(dst, src, name) {
+  const ws = dst.addWorksheet(name);
+  try { if (src.views && src.views.length) ws.views = JSON.parse(JSON.stringify(src.views)).map((v) => Object.assign(v, { tabSelected: false })); } catch (_) {}
+  if (src.properties && src.properties.defaultRowHeight) ws.properties.defaultRowHeight = src.properties.defaultRowHeight;
+  for (let c = 1; c <= src.columnCount; c++) { const a = src.getColumn(c), b = ws.getColumn(c); if (a.width) b.width = a.width; if (a.hidden) b.hidden = true; }
+  src.eachRow({ includeEmpty: true }, (row, rn) => {
+    const d = ws.getRow(rn);
+    if (row.height) d.height = row.height;
+    if (row.hidden) d.hidden = true;
+    row.eachCell({ includeEmpty: true }, (cell, cn) => {
+      const t = d.getCell(cn);
+      if (cell.type !== ExcelJS.ValueType.Merge) t.value = copyValue(cell);
+      if (cell.style) t.style = JSON.parse(JSON.stringify(cell.style));
+    });
+  });
+  Object.values(src._merges || {}).forEach((m) => { try { ws.mergeCells(m.range); } catch (_) {} });
+  return ws;
+}
+// values only (when the file cannot be opened with formatting, e.g. an old .xls)
+function plainSheet(dst, sw, name) {
+  const ws = dst.addWorksheet(name), rg = XLSX.utils.decode_range(sw["!ref"] || "A1");
+  for (let r = rg.s.r; r <= rg.e.r; r++) for (let c = rg.s.c; c <= rg.e.c; c++) {
+    const x = sw[XLSX.utils.encode_cell({ r, c })];
+    if (!x || x.v == null) continue;
+    const t = ws.getCell(r + 1, c + 1);
+    t.value = x.v instanceof Date ? xlDate(x.v) : x.v;
+    if (x.v instanceof Date) t.numFmt = "mm/dd/yyyy"; else if (x.z) t.numFmt = x.z;
+  }
+  (sw["!cols"] || []).forEach((c, i) => { if (c && c.wch) ws.getColumn(i + 1).width = c.wch; });
+  return ws;
+}
+async function sourceSheet(dst, k, sjsWs, sheet, name, notes) {
+  try {
+    const wb = await excelOf(k), src = wb.getWorksheet(sheet);
+    if (src) return copySheet(dst, src, name);
+  } catch (e) { notes.push(`${name}: copied as values only (${e.message})`); }
+  return plainSheet(dst, sjsWs, name);
+}
+// a simple table (sources remembered from the last saved summary: no file to copy)
+function tableSheet(dst, name, title, heads, rows) {
+  const ws = dst.addWorksheet(name);
+  ws.getCell("A1").value = title; ws.getCell("A1").font = { bold: true, size: 12 };
+  heads.forEach(([h, w], i) => addHead(ws, 3, i + 1, h, w));
+  rows.forEach((r, j) => r.forEach((v, i) => { if (v != null) addCell(ws, 4 + j, i + 1, v); }));
+  return { ws, first: 4, last: 3 + Math.max(1, rows.length) };
+}
+const sumifs = (name, amt, crit, L) => `SUMIFS(${qs(name)}!${amt},${qs(name)}!${crit},${L}$9)`;
+const colRange = (c, r1, r2) => `$${xlCol(c)}$${r1}:$${xlCol(c)}$${r2}`;
+const rowRange = (r, c1, c2) => `$${xlCol(c1)}$${r}:$${xlCol(c2)}$${r}`;
+
+// Retail basis of each forecast week (mirrors retailForecast)
+function retailBasis(wk) {
+  const st = retailStats();
+  if (!st) return wk.map(() => ({ actual: false, text: "" }));
+  const basis = $("rf-basis").value, M = basis === "trend" ? retailModel() : null;
+  let given = false;
+  return wk.map((w) => {
+    if (w.start <= st.last) return { actual: true, text: "Actual (Cash Flow Report)" };
+    if (M) {
+      if (M.method === "pattern") { const i = ((M.weekIndex(w.start) - M.n) % M.n + M.n) % M.n; return { text: `History pattern: same as the week of ${fmtDate(M.hist[i].monday)}` }; }
+      return { text: M.method === "linear" ? "Straight-line trend of the history weeks" : "Average of the history weeks" };
+    }
+    if ($("rf-apply").value === "all" || !given) { given = true; return { text: basis === "daily" ? `Average per business day (last ${st.n} weeks)` : `Average per business day × 5 (last ${st.n} weeks)` }; }
+    return { text: "" };
+  });
+}
+
+function bankSheet(dst, r) {
+  const name = "Bank Balances", ws = dst.addWorksheet(name);
+  [14, 22, 34, 18].forEach((w, i) => (ws.getColumn(i + 1).width = w));
+  ws.getCell("A1").value = "Bank balances — Beginning Balance of Week 1"; ws.getCell("A1").font = { bold: true, size: 12 };
+  ws.getCell("A2").value = `Week 1 starts ${r.wk[0].start.toLocaleDateString("en-PH", { month: "long", day: "numeric", year: "numeric" })}`;
+  ["Bank", "Account no.", "Purpose", "Balance (PHP)"].forEach((h, i) => addHead(ws, 4, i + 1, h));
+  accounts.forEach((a, j) => {
+    const row = 5 + j, usd = /USD\s*([\d,.]+)\s*[×x*]\s*([\d.]+)/i.exec(a.purpose || "");
+    ws.getCell(row, 1).value = a.bank; ws.getCell(row, 2).value = a.no; ws.getCell(row, 3).value = a.purpose;
+    const b = ws.getCell(row, 4);
+    b.value = usd ? { formula: `${usd[1].replace(/,/g, "")}*${usd[2]}`, result: a.bal || 0 } : a.bal || 0; b.numFmt = XL_NUM;
+  });
+  const tot = 5 + accounts.length;
+  ws.getCell(tot, 1).value = "Total"; ws.getCell(tot, 1).font = { bold: true };
+  const t = ws.getCell(tot, 4);
+  t.value = { formula: accounts.length ? `SUM(D5:D${tot - 1})` : "0", result: acctTotal() }; t.numFmt = XL_NUM; t.font = { bold: true }; t.border = { top: { style: "thin" }, bottom: { style: "double" } };
+  return `${qs(name)}!$D$${tot}`;
+}
+
+// Builds the detail sheets; returns { begin, links: { rowKey: (L) => formula } , notes }
+async function addDetailSheets(dst, r) {
+  const links = {}, notes = [], wk = r.wk, cache = {};
+  const begin = bankSheet(dst, r);
+  const sjs = (k) => editWorkbook(k);
+
+  // AR Corporate: copy of the Detail sheet + Summary week / EWT / Net cash / How it was placed
+  if (state.ar.buffer && r.arRes.lines.length) {
+    try {
+      const s = state.ar, name = "AR Corporate", sw = sjs("ar").Sheets[s.sheet], rg = XLSX.utils.decode_range(sw["!ref"] || "A1");
+      const hdr = rg.s.r + findHeader(gridOf(sw)).headerIdx + 1;
+      const ws = await sourceSheet(dst, "ar", sw, s.sheet, name, notes);
+      const W = rg.e.c + 2, E = W + 1, N = W + 2, Y = W + 3, aCol = rg.s.c + s.map.amount, A = xlCol(aCol + 1);
+      addHead(ws, hdr, W, "Summary week (Monday)", 14); addHead(ws, hdr, E, "EWT", 13); addHead(ws, hdr, N, "Net cash", 15); addHead(ws, hdr, Y, "How it was placed", 60);
+      let first = Infinity, last = 0;
+      for (const ln of r.arRes.lines) {
+        if (ln.row == null) continue;
+        const row = ln.row + 1, amtCell = sw[XLSX.utils.encode_cell({ r: ln.row, c: aCol })], isNum = amtCell && amtCell.t === "n";
+        first = Math.min(first, row); last = Math.max(last, row);
+        addCell(ws, row, W, typeof ln.slot === "number" ? wk[ln.slot].start : SLOT_TXT[ln.slot] || "");
+        addCell(ws, row, E, ln.ewtRate && isNum ? { formula: ln.nonVat ? `${A}${row}*${ln.ewtRate}` : `${A}${row}/${1 + r.rules.ewt.vat}*${ln.ewtRate}`, result: ln.ewt } : ln.ewt, XL_NUM);
+        addCell(ws, row, N, isNum ? { formula: `${A}${row}-${xlCol(E)}${row}`, result: ln.cash } : ln.cash, XL_NUM);
+        addCell(ws, row, Y, ln.why);
+      }
+      if (last) links.arCorp = (L) => sumifs(name, colRange(N, first, last), colRange(W, first, last), L);
+    } catch (e) { notes.push("AR Corporate sheet not added: " + e.message); }
+  }
+
+  // Retail: copy of the Cash Flow Report Summary sheet + Summary week per day + a weekly block used by the Summary
+  if (state.cf.buffer && state.cf.rows.length) {
+    try {
+      const s = state.cf, name = "Cash Flow Report";
+      const swb = s.wbEdit || XLSX.read(s.buffer, { type: "array", cellDates: true, sheets: [s.sheet] }), sw = swb.Sheets[s.sheet];
+      const res = parseCashflowReport(swb), rg = XLSX.utils.decode_range(sw["!ref"] || "A1"), hdr = res.hdr + 1;
+      const ws = await sourceSheet(dst, "cf", sw, s.sheet, name, notes);
+      const W = rg.e.c + 2, B = W + 2, act = res.cAct + 1;
+      addHead(ws, hdr, W, "Summary week (Monday)", 14);
+      let first = Infinity, last = 0;
+      for (const x of res.rows) { if (x.actual == null) continue; const row = x.r + 1; first = Math.min(first, row); last = Math.max(last, row); addCell(ws, row, W, mondayOf(x.date)); }
+      addHead(ws, hdr, B, "Summary week (Monday)", 14); addHead(ws, hdr, B + 1, "Retail (Credit Card)", 17); addHead(ws, hdr, B + 2, "Basis", 46);
+      const bas = retailBasis(wk);
+      wk.forEach((w, i) => {
+        const row = hdr + 1 + i;
+        addCell(ws, row, B, w.start);
+        addCell(ws, row, B + 1, bas[i].actual && last ? { formula: `SUMIFS(${colRange(act, first, last)},${colRange(W, first, last)},${xlCol(B)}${row})`, result: r.base.retail[i] } : r.base.retail[i], XL_NUM);
+        addCell(ws, row, B + 2, bas[i].text);
+      });
+      links.retail = (L, i) => `${qs(name)}!$${xlCol(B + 1)}$${hdr + 1 + i}`;
+    } catch (e) { notes.push("Cash Flow Report sheet not added: " + e.message); }
+  }
+
+  // Unit Disposals: copy of the Weekly Cash Flow sheet + a "Summary week" row under it
+  if (state.ds.rows.length) {
+    try {
+      const s = state.ds, name = "Unit Disposals";
+      if (s.buffer) {
+        const res = parseUnitDisposals(sjs("ds")), sw = sjs("ds").Sheets[res.sheet], rg = XLSX.utils.decode_range(sw["!ref"] || "A1");
+        const ws = await sourceSheet(dst, "ds", sw, res.sheet, name, notes), R = rg.e.r + 3;
+        addHead(ws, R, rg.s.c + 1, "Summary week (Monday)");
+        res.rows.forEach((x) => addCell(ws, R, x.c + 1, x.monday));
+        const c1 = Math.min(...res.rows.map((x) => x.c)) + 1, c2 = Math.max(...res.rows.map((x) => x.c)) + 1;
+        links.disposal = (L) => sumifs(name, rowRange(res.amtRow + 1, c1, c2), rowRange(R, c1, c2), L);
+      } else {
+        const t = tableSheet(dst, name, `Unit Disposals — kept in the last saved summary${s.savedFrom ? ` (${s.savedFrom})` : ""}`,
+          [["From", 12], ["To", 12], ["Units", 8], ["Disposal proceeds", 18], ["Summary week (Monday)", 14]],
+          s.rows.map((x) => [x.from, x.to, x.units, x.amount, x.monday]));
+        links.disposal = (L) => sumifs(name, colRange(4, t.first, t.last), colRange(5, t.first, t.last), L);
+      }
+    } catch (e) { notes.push("Unit Disposals sheet not added: " + e.message); }
+  }
+
+  // Cash Out: one sheet per file (amounts are cash going out: the Summary shows them negative)
+  const CO_SHEET = { loans: ["ln", "Loan Payments"], checks: ["uc", "Unreleased Checks"], projout: ["po", "Projected Payments"] };
+  for (const [rk, [k, name]] of Object.entries(CO_SHEET)) {
+    const s = state[k];
+    if (!Object.keys(s.byDate).length) continue;
+    try {
+      if (s.buffer) {
+        const swb = sjs(k), res = CO_META[k].parse(swb), loc = res.loc, sw = swb.Sheets[loc.sheet], rg = XLSX.utils.decode_range(sw["!ref"] || "A1");
+        const ws = await sourceSheet(dst, k, sw, loc.sheet, name, notes);
+        if (k === "po") {                                       // weeks across: a "Summary week" row (and the amount used, if there is no TOTAL row)
+          const R = rg.e.r + 3, c1 = Math.min(...loc.cols.map((x) => x.c)) + 1, c2 = Math.max(...loc.cols.map((x) => x.c)) + 1;
+          addHead(ws, R, rg.s.c + 1, "Summary week (Monday)");
+          loc.cols.forEach((x) => addCell(ws, R, x.c + 1, x.monday));
+          let amtRow = loc.totRow + 1;
+          if (loc.totRow < 0) { amtRow = R + 1; addHead(ws, amtRow, rg.s.c + 1, "Amount used"); loc.cols.forEach((x) => addCell(ws, amtRow, x.c + 1, x.amt, XL_NUM)); }
+          links[rk] = (L) => "-" + sumifs(name, rowRange(amtRow, c1, c2), rowRange(R, c1, c2), L);
+        } else {                                                // one line per payment / check: a "Summary week" column
+          const W = rg.e.c + 2, hdr = loc.hdr + 1;
+          addHead(ws, hdr, W, "Summary week (Monday)", 14);
+          let first = Infinity, last = 0;
+          for (const x of loc.lines) { const row = x.r + 1; first = Math.min(first, row); last = Math.max(last, row); addCell(ws, row, W, x.date ? mondayOf(x.date) : "No clearing date"); }
+          if (last) links[rk] = (L) => "-" + sumifs(name, colRange(loc.cAmt + 1, first, last), colRange(W, first, last), L);
+        }
+      } else {
+        const days = Object.keys(s.byDate).sort();
+        const t = tableSheet(dst, name, `${CO_META[k].label} — kept in the last saved summary${s.savedFrom ? ` (${s.savedFrom})` : ""}`,
+          [["Date", 12], ["Amount", 16], ["Summary week (Monday)", 14]],
+          days.map((d) => { const dt = new Date(d + "T00:00:00"); return [dt, s.byDate[d], mondayOf(dt)]; }));
+        links[rk] = (L) => "-" + sumifs(name, colRange(2, t.first, t.last), colRange(3, t.first, t.last), L);
+      }
+    } catch (e) { notes.push(`${name} sheet not added: ` + e.message); }
+  }
+  return { begin, links, notes };
+}
+
 async function buildWorkbookXlsx(sig) {
   const r = report, c = compute(r), wk = r.wk, n = wk.length;
   const FIRST = 6, LAST = FIRST + n - 1, TOT = LAST + 1;               // week columns start at F; Total after the last week
@@ -1421,6 +1654,15 @@ async function buildWorkbookXlsx(sig) {
   wb.description = "cashflow-sig:" + (sig || "");
   wb.keywords = "cf-state:" + encodeState(carryState());
   const ws = wb.addWorksheet("Summary", { views: [{ state: "frozen", xSplit: 5, ySplit: 10, zoomScale: 75, showGridLines: false }] });
+  const det = await addDetailSheets(wb, r);
+  // amount cell of a row: a formula into its detail sheet; a typed change is kept as "+ (adjustment)"
+  const ADJ_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
+  const amountCell = (k, i, L) => {
+    const link = det.links[k], val = c.v[k][i];
+    if (!link) return { v: val };
+    const adj = Math.round((val - r.base[k][i]) * 100) / 100, f = link(L, i);
+    return Math.abs(adj) >= 0.01 ? { v: { formula: `${f}+(${adj})`, result: val }, adj: true } : { v: { formula: f, result: val } };
+  };
 
   // column widths as in the template
   [8.1, 29, 6.3, 9.1, 9.1].forEach((w, i) => (ws.getColumn(i + 1).width = w));
@@ -1474,7 +1716,7 @@ async function buildWorkbookXlsx(sig) {
   const inFirst = row;
   for (const [k, label] of rowOrder.in.map((k) => [k, xlLabel(k)])) {
     put(`B${row}`, label);
-    weekCells(row, (L, i) => put(`${L}${row}`, c.v[k][i], { fmt: XL_NUM }));
+    weekCells(row, (L, i) => { const a = amountCell(k, i, L), x = put(`${L}${row}`, a.v, { fmt: XL_NUM }); if (a.adj) x.fill = ADJ_FILL; });
     put(`${xlCol(TOT)}${row}`, { formula: totalFormula(row), result: sum(c.v[k]) }, { fmt: XL_NUM, bold: true });
     row++;
   }
@@ -1489,7 +1731,7 @@ async function buildWorkbookXlsx(sig) {
   const outFirst = row;
   for (const [k, label] of rowOrder.out.map((k) => [k, xlLabel(k)])) {
     put(`B${row}`, label);
-    weekCells(row, (L, i) => put(`${L}${row}`, c.v[k][i], { fmt: XL_NUM }));
+    weekCells(row, (L, i) => { const a = amountCell(k, i, L), x = put(`${L}${row}`, a.v, { fmt: XL_NUM }); if (a.adj) x.fill = ADJ_FILL; });
     put(`${xlCol(TOT)}${row}`, { formula: totalFormula(row), result: sum(c.v[k]) }, { fmt: XL_NUM, bold: true });
     row++;
   }
@@ -1515,11 +1757,13 @@ async function buildWorkbookXlsx(sig) {
 
   // Beginning Balance row: week 1 = opening cash, then previous week's ending balance
   weekCells(rBegin, (L, i) => {
-    const v = i === 0 ? c.opening : { formula: `${xlCol(FIRST + i - 1)}${rEnd}`, result: c.v.begin[i] };
+    const v = i === 0 ? { formula: det.begin, result: c.opening } : { formula: `${xlCol(FIRST + i - 1)}${rEnd}`, result: c.v.begin[i] };
     put(`${L}${rBegin}`, v, { bold: true, fmt: XL_NUM, align: "center" });
   });
   put(`${xlCol(TOT)}${rBegin}`, { formula: `${xlCol(FIRST)}${rBegin}`, result: c.opening }, { bold: true, fmt: XL_NUM, align: "center" });
 
+  if (det.notes.length) toast("Summary detail sheets:<small>" + det.notes.map(escapeHtml).join("<br>") + "</small>", true, 10000);
+  wb.calcProperties = Object.assign(wb.calcProperties || {}, { fullCalcOnLoad: true });   // Excel recalculates the links on open
   return wb.xlsx.writeBuffer();
 }
 
@@ -1585,7 +1829,7 @@ Cancel = don't save (reload the page to start from their summary)`)) return;
   if (!wr.ok) { toast(escapeHtml(wr.msg), true, 8000); return; }
   renderFileList();
   if (!$("fe-modal").classList.contains("hidden")) renderEditor();
-  saveStep("Building the summary…");
+  saveStep("Building the summary + detail sheets…");
   const sig = summarySignature();
   const buf = await buildWorkbookXlsx(sig);
   saveStep("Writing to the folder…");
@@ -2464,6 +2708,43 @@ function xlFeatures(buf) {
   try { return new Set((XLSX.read(buf, { type: "array", bookFiles: true, sheetRows: 1 }).keys || []).map(cat).filter(Boolean)); } catch (_) { return new Set(); }
 }
 
+// The uploaded file as it is now in the system (inserted lines and edits included; edited cells yellow), as ExcelJS.
+async function excelOf(k) {
+  const s = state[k];
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(s.buffer);
+  if (s.ops && s.ops.length) replayInserts(wb, s.ops);
+  for (const [sheet, cells] of Object.entries(s.edits)) {
+    const ws = wb.getWorksheet(sheet);
+    if (!ws) continue;
+    for (const [addr, val] of Object.entries(cells)) {
+      const cell = ws.getCell(addr);
+      if (val && typeof val === "object" && !(val instanceof Date) && val.formula) {
+        const now = s.wbEdit && s.wbEdit.Sheets[sheet] && s.wbEdit.Sheets[sheet][addr];
+        cell.value = { formula: val.formula, result: now && typeof now.v === "number" ? now.v : undefined };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
+        continue;
+      }
+      cell.value = val instanceof Date ? xlDate(val) : val;
+      if (val instanceof Date && !/[dmy]/i.test(cell.numFmt || "")) cell.numFmt = "yyyy-mm-dd";
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
+    }
+  }
+  // totals and other formulas that the system recalculated: keep the formula, store the new result
+  for (const [sheet, set] of Object.entries(s.recalc || {})) {
+    const ws = wb.getWorksheet(sheet), src = s.wbEdit && s.wbEdit.Sheets[sheet];
+    if (!ws || !src) continue;
+    for (const addr of set) {
+      if (s.edits[sheet] && addr in s.edits[sheet]) continue;
+      const cell = ws.getCell(addr), now = src[addr];
+      if (!now) continue;
+      const res = now.v instanceof Date ? xlDate(now.v) : now.v, cv = cell.value;
+      if (cv && typeof cv === "object" && (cv.formula || cv.sharedFormula)) cell.value = Object.assign({}, cv, { result: res });
+    }
+  }
+  return wb;
+}
+
 // ---- write the edits into the ORIGINAL files (called from Save summary)
 async function writeEditedOriginals() {
   const todo = FILE_KINDS.map(([k]) => k).filter((k) => hasOriginal(k) && editCount(k) && state[k].handle);
@@ -2481,37 +2762,7 @@ async function writeEditedOriginals() {
     const s = state[k], hnd = s.handle;
     if (!/\.(xlsx|xlsm)$/i.test(hnd.name)) { toast(`"${escapeHtml(hnd.name)}" is not an .xlsx file — its edits stay in the system only.`, true, 7000); continue; }
     // rebuild the file with ExcelJS: only the edited cells change (and turn yellow)
-    const wb = new ExcelJS.Workbook();
-    await wb.xlsx.load(s.buffer);
-    if (s.ops && s.ops.length) replayInserts(wb, s.ops);
-    for (const [sheet, cells] of Object.entries(s.edits)) {
-      const ws = wb.getWorksheet(sheet);
-      if (!ws) continue;
-      for (const [addr, val] of Object.entries(cells)) {
-        const cell = ws.getCell(addr);
-        if (val && typeof val === "object" && !(val instanceof Date) && val.formula) {
-          const now = s.wbEdit && s.wbEdit.Sheets[sheet] && s.wbEdit.Sheets[sheet][addr];
-          cell.value = { formula: val.formula, result: now && typeof now.v === "number" ? now.v : undefined };
-          cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
-          continue;
-        }
-        cell.value = val instanceof Date ? xlDate(val) : val;
-        if (val instanceof Date && !/[dmy]/i.test(cell.numFmt || "")) cell.numFmt = "yyyy-mm-dd";
-        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
-      }
-    }
-    // totals and other formulas that the system recalculated: keep the formula, store the new result
-    for (const [sheet, set] of Object.entries(s.recalc || {})) {
-      const ws = wb.getWorksheet(sheet), src = s.wbEdit && s.wbEdit.Sheets[sheet];
-      if (!ws || !src) continue;
-      for (const addr of set) {
-        if (s.edits[sheet] && addr in s.edits[sheet]) continue;
-        const cell = ws.getCell(addr), now = src[addr];
-        if (!now) continue;
-        const res = now.v instanceof Date ? xlDate(now.v) : now.v, cv = cell.value;
-        if (cv && typeof cv === "object" && (cv.formula || cv.sharedFormula)) cell.value = Object.assign({}, cv, { result: res });
-      }
-    }
+    const wb = await excelOf(k);
     wb.calcProperties = Object.assign(wb.calcProperties || {}, { fullCalcOnLoad: true });   // Excel also recalculates on open
     const out = await wb.xlsx.writeBuffer();
     // warn when the rewrite would drop Excel features (pivot tables, charts, …) and let the user decide
