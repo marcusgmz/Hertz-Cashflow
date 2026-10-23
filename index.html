@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hertz Cashflow Summary</title>
+<link rel="icon" href="logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+
+  <!-- ============ SIDEBAR: logo, navigation, folder, uploads ============ -->
+  <aside class="sidebar">
+    <img class="logo-img" src="logo.png" alt="Hertz">
+
+    <div class="side-group">
+      <div class="side-title">Menu</div>
+      <nav class="side-nav" id="tabs" aria-label="Sections">
+        <button class="tab active" data-tab="summary">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+          Summary
+        </button>
+        <button class="tab" data-tab="detail">
+          <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+          Customer / Vendor
+        </button>
+        <button class="tab" data-tab="pastdue">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+          Past Due
+        </button>
+        <button class="tab" data-tab="retail">
+          <svg viewBox="0 0 24 24"><path d="M3 20h18M6 16v-5M11 16V6M16 16v-8M21 16v-3"/></svg>
+          Retail Trend
+        </button>
+        <button class="tab" data-tab="setup">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg>
+          Setup
+        </button>
+      </nav>
+    </div>
+
+    <div class="side-group">
+      <div class="side-title">Upload files</div>
+      <button class="upload-btn" id="btn-upload" type="button">
+        <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7 9m5-5l5 5M4 16v3a1 1 0 001 1h14a1 1 0 001-1v-3"/></svg>
+        Upload
+      </button>
+    </div>
+
+    <div class="side-group hidden" id="side-files">
+      <div class="side-title">Uploaded files</div>
+      <div class="file-list" id="file-list"></div>
+    </div>
+
+    <div class="side-group side-bottom">
+      <button id="btn-user" class="folder-btn user-btn" type="button" title="Your name (shown to others while you prepare the cashflow)"><span>👤</span><span id="user-label">Set your name</span></button>
+      <button id="btn-folder" class="folder-btn" title="Connect folder"><span class="dot" id="folder-dot"></span><span id="folder-label">Connect folder</span></button>
+      <span id="folder-text" class="hidden"></span>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN COLUMN ============ -->
+  <div class="main-col">
+
+    <div class="lock-banner hidden" id="lock-banner"></div>
+    <header class="topbar">
+      <div class="title-block">
+        <h1>Cashflow Summary</h1>
+        <p id="top-sub">Upload the AR Aging and AP Aging files to begin</p>
+      </div>
+      <div class="top-actions">
+        <span class="chip" id="last-saved" title=""></span>
+        <button class="btn outline" id="btn-edit" disabled>✎ Edit</button>
+        <button class="btn primary" id="btn-save" disabled>Save summary</button>
+      </div>
+    </header>
+
+    <main class="page">
+      <div class="empty" id="empty">
+        <div class="empty-icon">📊</div>
+        <h2>Your cashflow summary will appear here</h2>
+        <p>Click Upload in the sidebar to add the AR Aging and AP Aging files to generate a weekly preview.</p>
+      </div>
+
+      <section id="review" class="hidden">
+
+        <!-- ===== Summary ===== -->
+        <div class="pane" id="pane-summary">
+          <div class="cards">
+            <div class="card"><div class="card-label">Beginning cash</div><div class="card-value" id="card-begin">-</div>
+              <button class="link" id="btn-bal">Edit balances</button></div>
+            <div class="card in"><div class="card-label">Total cash in</div><div class="card-value" id="card-in">-</div><div class="card-sub" id="card-in-sub"></div></div>
+            <div class="card out"><div class="card-label">Total cash out</div><div class="card-value" id="card-out">-</div><div class="card-sub" id="card-out-sub"></div></div>
+            <div class="card"><div class="card-label">Net cash flow</div><div class="card-value" id="card-net">-</div><div class="card-sub" id="card-net-sub"></div></div>
+            <div class="card key"><div class="card-label">Ending cash</div><div class="card-value" id="card-end">-</div><div class="card-sub" id="card-end-sub"></div></div>
+          </div>
+
+          <div class="data-card">
+            <div class="data-head">
+              <div>
+                <h2 id="rpt-weeks">13 Week Forecast</h2>
+                <p class="muted"><span id="rpt-company"></span> · <span id="rpt-range"></span> · In Philippine Pesos</p>
+              </div>
+              <div class="controls">
+                <label>Week 1 starts (Monday)<input type="date" id="opt-start"></label>
+                <label>Weeks<input type="number" id="opt-weeks" min="1" max="52" value="13"></label>
+                <button class="btn ghost small" id="btn-add-row" disabled>+ Add row</button>
+                <button class="btn ghost small hidden" id="btn-reset">Reset edits</button>
+              </div>
+            </div>
+            <div class="edit-banner" id="edit-hint">Preview only — nothing is saved until you click Save summary.</div>
+            <div class="table-wrap" id="table-summary"></div>
+            <p class="note hidden" id="notes" hidden></p>
+          </div>
+        </div>
+
+        <!-- ===== Detail ===== -->
+        <div class="pane hidden" id="pane-detail">
+          <div class="data-card">
+            <div class="data-head"><div><h2>Customer / vendor detail</h2><p class="muted">Expected cash collection per customer (AR Corporate), by forecast week, after allowance and EWT.</p></div></div>
+            <div class="table-wrap" id="table-detail"></div>
+          </div>
+        </div>
+
+        <!-- ===== Past Due ===== -->
+        <div class="pane hidden" id="pane-pastdue">
+          <div class="data-card">
+            <div class="data-head">
+              <div><h2>Past due invoices</h2><p class="muted" id="pd-sub">Open invoices whose due date has passed, grouped by how late they are.</p></div>
+              <div class="controls">
+                <label>Search<input type="text" id="pd-search" placeholder="Customer, invoice or remark"></label>
+                <label>Remarks<select id="pd-remark"></select></label>
+              </div>
+            </div>
+            <div class="bd-chips" id="pd-chips"></div>
+            <div class="pd-filter" id="pd-filter" role="group" aria-label="Filter by days overdue"></div>
+            <div class="table-wrap pd-scroll" id="pd-list"></div>
+          </div>
+        </div>
+
+        <!-- ===== Retail Trend ===== -->
+        <div class="pane hidden" id="pane-retail">
+          <div class="data-card">
+            <div class="data-head">
+              <div><h2>Retail collection trend</h2><p class="muted" id="rt-sub">Source: Cash Flow Report · Summary sheet · "Actual Retail Collection" (column G).</p></div>
+              <div class="controls">
+                <label>Show the last
+                  <select id="rt-weeks">
+                    <option value="1" selected>1 week (5 business days)</option>
+                    <option value="2">2 weeks</option>
+                    <option value="4">4 weeks</option>
+                    <option value="8">8 weeks</option>
+                    <option value="12">12 weeks</option>
+                    <option value="all">All weeks</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="bd-chips" id="rt-chips"></div>
+            <div id="rt-chart" class="rt-chart"></div>
+            <div class="table-wrap" id="rt-days"></div>
+            <details class="pd-group" id="rt-weekly-box">
+              <summary><span class="pd-name">Weekly totals (all weeks in the report)</span></summary>
+              <div class="table-wrap" id="rt-weekly"></div>
+            </details>
+          </div>
+
+          <div class="data-card" style="margin-top:20px">
+            <div class="data-head">
+              <div><h2>Weekly trend expanded to 13 weeks</h2><p class="muted" id="rx-sub">History of weekly Retail collections, projected forward 13 weeks.</p></div>
+              <div class="controls">
+                <label>History from<input type="date" id="rx-from" value="2026-08-31"></label>
+                <label>to<input type="date" id="rx-to" value="2026-10-09"></label>
+                <label>Expand using
+                  <select id="rx-method">
+                    <option value="pattern" selected>Repeat the history pattern</option>
+                    <option value="linear">Straight-line trend (rises/falls each week)</option>
+                    <option value="avg">Flat average of the history</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="bd-chips" id="rx-chips"></div>
+            <div id="rx-chart" class="rt-chart"></div>
+            <div class="table-wrap" id="rx-table"></div>
+          </div>
+        </div>
+
+        <!-- ===== Setup ===== -->
+        <div class="pane hidden" id="pane-setup">
+          <div class="setup-grid">
+            <div class="data-card">
+              <div class="data-head"><div><h2>Uploaded files</h2><p class="muted">What was read from each file and which columns are used.</p></div></div>
+              <div class="files">
+                <div class="file-card"><div class="drop-head"><h3>AR Aging</h3></div>
+                  <div class="file-info" id="info-ar"><span class="muted">No file uploaded yet.</span></div>
+                  <details class="mapping-box hidden" id="mapbox-ar" open><summary>Column mapping</summary><div class="mapping" id="map-ar"></div></details></div>
+                <div class="file-card hidden"><div class="drop-head"><h3>AP Aging</h3></div>
+                  <div class="file-info" id="info-ap"><span class="muted">No file uploaded yet.</span></div>
+                  <details class="mapping-box hidden" id="mapbox-ap" open><summary>Column mapping</summary><div class="mapping" id="map-ap"></div></details></div>
+              </div>
+            </div>
+
+            <div class="data-card">
+              <div class="data-head"><div><h2>Report</h2><p class="muted">Name shown on the summary.</p></div></div>
+              <label class="field">Company name<input type="text" id="opt-company" value="HERTZ PHILIPPINES, INC."></label>
+            </div>
+
+            <div class="data-card wide" id="rules-panel">
+              <div class="data-head"><div><h2>AR collection rules</h2><p class="muted">How the AR Aging file becomes expected weekly collections (AR Corporate row). Changing a value recalculates the preview.</p></div></div>
+              <div class="rules-grid">
+                <div class="rule-block">
+                  <h3>Report date</h3>
+                  <label class="field">Aging as-of date<input type="date" id="opt-asof"></label>
+                  <p class="muted">Days past due are recalculated from each invoice's Due Date against this date.</p>
+                </div>
+                <div class="rule-block">
+                  <h3>Allowance added to Due Date <span class="muted">(days)</span></h3>
+                  <label class="inline">All In – ST<input type="number" id="al-allin" value="7" min="0"></label>
+                  <label class="inline">Fuel, Toll, Driver's OT, Meals, R&amp;M, Others<input type="number" id="al-other" value="14" min="0"></label>
+                  <label class="inline">Fixed Monthly (advance invoicing)<input type="number" id="al-fixed" value="7" min="0"></label>
+                </div>
+                <div class="rule-block">
+                  <h3>Overdue invoices <span class="muted">→ collected in week # (blank = not in forecast)</span></h3>
+                  <p class="muted">When the AR file has a <b>Projected Date</b>, invoices whose due date + allowance has passed use that date instead. "-" = not in the forecast. Blank = the week numbers below.</p>
+                  <label class="inline">1–30 days overdue<input type="number" id="bk-30" value="1" min="1"></label>
+                  <label class="inline">31–60 days<input type="number" id="bk-60" value="2" min="1"></label>
+                  <label class="inline">61–90 days<input type="number" id="bk-90" value="4" min="1"></label>
+                  <label class="inline">91–120 days<input type="number" id="bk-120" value="8" min="1"></label>
+                  <label class="inline">Over 120 days<input type="number" id="bk-max" value="" min="1" placeholder="none"></label>
+                </div>
+                <div class="rule-block">
+                  <h3>EWT (withholding tax)</h3>
+                  <label class="check"><input type="checkbox" id="ewt-on" checked> Deduct EWT from collections</label>
+                  <label class="inline">Rental (All In – ST, Fixed Monthly) %<input type="number" id="ewt-rental" value="5" min="0" step="0.5"></label>
+                  <label class="inline">Other charges %<input type="number" id="ewt-other" value="2" min="0" step="0.5"></label>
+                  <label class="inline">VAT % (removed before EWT)<input type="number" id="ewt-vat" value="12" min="0" step="0.5"></label>
+                  <label class="field">Customers that do NOT deduct EWT (one per line)<textarea id="ewt-exempt" rows="3" placeholder="Customer name exactly as in the file"></textarea></label>
+                </div>
+                <div class="rule-block">
+                  <h3>Files</h3>
+                  <label class="check"><input type="checkbox" id="opt-autosave"> Auto-save uploaded files to "Uploaded Files"</label>
+                  <p class="muted">Off by default. When off, uploaded files are only read, not copied. "Save summary" is always manual.</p>
+                </div>
+              </div>
+            </div>
+
+            <div class="data-card wide" id="cashout-panel">
+              <div class="data-head"><div><h2>Cash Out sources</h2><p class="muted">Uploaded once, then kept in each saved summary and reused every week until a new file is uploaded. Amounts are placed in the Monday–Sunday week of their date.</p></div></div>
+              <div class="table-wrap" id="co-sources"></div>
+            </div>
+
+            <div class="data-card wide" id="disposal-panel">
+              <div class="data-head"><div><h2>Proceeds from Disposal</h2><p class="muted">From the <b>Unit Disposals</b> file: the "Disposal proceeds" row of its Weekly Cash Flow sheet, week by week. Each of the file's weeks goes into the Monday–Sunday Summary week that holds most of its days.</p></div></div>
+              <div class="table-wrap" id="ds-months"><span class="muted">No Unit Disposals file uploaded yet.</span></div>
+            </div>
+
+            <div class="data-card wide" id="retail-panel">
+              <div class="data-head"><div><h2>Retail forecast</h2><p class="muted">Fills the Retail (Credit Card) row from the Cash Flow Report. The average comes from the window chosen on the Retail Trend tab.</p></div></div>
+              <div class="rules-grid">
+                <div class="rule-block">
+                  <h3>Amount per week</h3>
+                  <label class="field">Use
+                    <select id="rf-basis">
+                      <option value="trend" selected>Weekly trend from the Retail Trend tab (all 13 weeks)</option>
+                      <option value="week">Daily average × 5 business days (weekly amount)</option>
+                      <option value="daily">Daily average as shown (no multiplication)</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="rule-block">
+                  <h3>Weeks that receive it <span class="muted">(average options only)</span></h3>
+                  <label class="field">Apply to
+                    <select id="rf-apply">
+                      <option value="first" selected>Week 1 only (first week after the report's last actual date)</option>
+                      <option value="all">Every week after the report's last actual date</option>
+                    </select>
+                  </label>
+                  <p class="muted">Weeks that already have actuals in the report show their actual weekly total.</p>
+                </div>
+              </div>
+            </div>
+
+            <div class="data-card wide" id="bal-panel">
+              <div class="data-head">
+                <div><h2>Cash balances</h2><p class="muted">The total becomes the Beginning Balance of Week 1.</p></div>
+                <div class="bal-total">Total <strong id="bal-total">-</strong></div>
+              </div>
+              <div class="table-wrap">
+                <table id="tbl-accounts">
+                  <thead><tr><th>Bank / Account</th><th>Account No.</th><th>Purpose</th><th>Balance (PHP)</th><th></th></tr></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+              <button class="btn ghost small" id="btn-add-acct">+ Add account</button>
+            </div>
+          </div>
+        </div>
+
+      </section>
+    </main>
+  </div>
+</div>
+
+
+<!-- ============ UPLOAD POP-UP ============ -->
+<div class="modal-backdrop hidden" id="upload-modal" role="dialog" aria-modal="true" aria-labelledby="um-title">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="um-title">Upload files</h2>
+      <button class="icon-btn" id="um-close" type="button" aria-label="Close">✕</button>
+    </div>
+    <p class="muted">Choose or drag a file into each slot. The summary preview updates automatically. Copying files into "Uploaded Files" is controlled in Setup (off by default).</p>
+    <div class="um-list">
+      <div class="um-row drop" id="drop-ar">
+        <div class="um-info"><div class="um-label">AR Aging</div><div class="um-status" id="mstat-ar">No file chosen</div></div>
+        <label class="btn outline small" for="file-ar">Choose file</label>
+        <input type="file" id="file-ar" accept=".xlsx,.xls,.xlsm,.csv" hidden>
+      </div>
+      <div class="um-row drop hidden" id="drop-ap"><!-- AP Aging: not used (hidden) -->
+        <div class="um-info"><div class="um-label">AP Aging</div><div class="um-status" id="mstat-ap">No file chosen</div></div>
+        <label class="btn outline small" for="file-ap">Choose file</label>
+        <input type="file" id="file-ap" accept=".xlsx,.xls,.xlsm,.csv" hidden>
+      </div>
+      <div class="um-row drop" id="drop-cf">
+        <div class="um-info"><div class="um-label">Cash Flow Report <span class="muted">(Retail trend)</span></div><div class="um-status" id="mstat-cf">No file chosen</div></div>
+        <label class="btn outline small" for="file-cf">Choose file</label>
+        <input type="file" id="file-cf" accept=".xlsx,.xls,.xlsm" hidden>
+      </div>
+      <div class="um-row drop" id="drop-ds">
+        <div class="um-info"><div class="um-label">Unit Disposals <span class="muted">(Proceeds from Disposal · upload when it changes)</span></div><div class="um-status" id="mstat-ds">No file chosen</div></div>
+        <label class="btn outline small" for="file-ds">Choose file</label>
+        <input type="file" id="file-ds" accept=".xlsx,.xls,.xlsm" hidden>
+      </div>
+      <div class="um-row drop" id="drop-ln">
+        <div class="um-info"><div class="um-label">Loan Payment Schedule <span class="muted">(Cash Out · upload once)</span></div><div class="um-status" id="mstat-ln">No file chosen</div></div>
+        <label class="btn outline small" for="file-ln">Choose file</label>
+        <input type="file" id="file-ln" accept=".xlsx,.xls,.xlsm" hidden>
+      </div>
+      <div class="um-row drop" id="drop-uc">
+        <div class="um-info"><div class="um-label">Unreleased Checks <span class="muted">(Cash Out · upload once)</span></div><div class="um-status" id="mstat-uc">No file chosen</div></div>
+        <label class="btn outline small" for="file-uc">Choose file</label>
+        <input type="file" id="file-uc" accept=".xlsx,.xls,.xlsm" hidden>
+      </div>
+      <div class="um-row drop" id="drop-po">
+        <div class="um-info"><div class="um-label">Projected Cash Outflow <span class="muted">(Cash Out · upload once)</span></div><div class="um-status" id="mstat-po">No file chosen</div></div>
+        <label class="btn outline small" for="file-po">Choose file</label>
+        <input type="file" id="file-po" accept=".xlsx,.xls,.xlsm" hidden>
+      </div>
+    </div>
+    <div class="modal-foot"><button class="btn primary" id="um-done" type="button">Done</button></div>
+  </div>
+</div>
+
+<!-- ============ AR CORPORATE BREAKDOWN POP-UP ============ -->
+<div class="modal-backdrop hidden" id="bd-modal" role="dialog" aria-modal="true" aria-labelledby="bd-title">
+  <div class="modal modal-wide">
+    <div class="modal-head">
+      <h2 id="bd-title">AR Corporate</h2>
+      <button class="icon-btn" id="bd-close" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="bd-chips" id="bd-chips"></div>
+    <div class="bd-tools"><label>Remarks <select id="bd-rem"></select></label></div>
+    <p class="bd-note hidden" id="bd-note"></p>
+    <div class="table-wrap bd-table" id="bd-table"></div>
+    <div class="modal-foot"><button class="btn primary" id="bd-done" type="button">Close</button></div>
+  </div>
+</div>
+
+<!-- ============ FILE EDITOR ============ -->
+<div class="modal-backdrop hidden" id="fe-modal" role="dialog" aria-modal="true" aria-labelledby="fe-title">
+  <div class="modal modal-editor">
+    <div class="modal-head">
+      <div><h2 id="fe-title">Edit file</h2><p class="muted" id="fe-sub"></p></div>
+      <button class="icon-btn" id="fe-close" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="fe-tabs" id="fe-tabs"></div>
+    <div class="fe-tools">
+      <input type="text" id="fe-search" placeholder="Search in this sheet…">
+      <div class="fe-pager"><button type="button" class="btn ghost small" id="fe-prev">‹ Prev</button><span id="fe-range" class="muted"></span><button type="button" class="btn ghost small" id="fe-next">Next ›</button></div>
+      <button type="button" class="btn ghost small" id="fe-addrow" title="Insert a row below the selected cell (copies its row's format and formulas)">+ Row below</button>
+      <button type="button" class="btn ghost small" id="fe-addcol" title="Insert a column right of the selected cell (copies its column's format and formulas)">+ Column right</button>
+      <button type="button" class="btn ghost small" id="fe-find" title="Ctrl+H">Find &amp; Replace</button>
+      <button type="button" class="btn ghost small hidden" id="fe-clearf">Clear filters</button>
+      <button type="button" class="btn ghost small" id="fe-undo">Undo all edits in this file</button>
+    </div>
+    <div class="fe-warn hidden" id="fe-warn"></div>
+    <p class="muted fe-help">Click a cell to select it · drag or Shift+click to select a range · click a column letter / row number to select it all · type a value and press <b>Enter</b> to put it in <b>every selected cell</b> · <b>Delete</b> clears them · double-click or F2 edits one cell · ▾ on a column = filter · <span class="fx-key">ƒ</span> cells are formulas (e.g. totals =SUM): they recalculate and are kept; type <b>=</b>… to enter a formula.</p>
+    <div class="table-wrap fe-grid" id="fe-grid" tabindex="0"></div>
+    <div class="fe-pop hidden" id="fe-pop"></div>
+    <div class="modal-foot fe-foot"><span class="muted" id="fe-note"></span><button class="btn primary" id="fe-done" type="button">Done</button></div>
+  </div>
+</div>
+
+<div class="toast hidden" id="toast"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
