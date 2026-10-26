@@ -2141,9 +2141,20 @@ function headerRowIdx(grid) {
 }
 const fkey = (v) => showVal(v);
 // shown in the grid: 550000 -> 550,000 · 14352.54 -> 14,352.54 (years like 2021 in a "Year" column stay as is)
-function dispVal(v, yearCol) {
+// Columns the file itself shows WITHOUT thousands commas (IDs, check / pay numbers, codes): keep them that way.
+function plainCols(ws) {
+  const st = {};
+  for (const [a, x] of Object.entries(ws)) {
+    if (a[0] === "!" || !x || x.t !== "n" || typeof x.w !== "string" || Math.abs(x.v) < 1000) continue;
+    const c = XLSX.utils.decode_cell(a).c, s = (st[c] = st[c] || { comma: 0, plain: 0 });
+    if (x.w.includes(",")) s.comma++; else if (/^\s*-?\d+(\.\d+)?\s*$/.test(x.w)) s.plain++;
+  }
+  return new Set(Object.entries(st).filter(([, s]) => s.plain && !s.comma).map(([c]) => +c));
+}
+function dispVal(v, yearCol, plain) {
   if (typeof v !== "number") return showVal(v);
   if (yearCol && Number.isInteger(v) && v >= 1900 && v <= 2100) return String(v);
+  if (plain) return String(Math.round(v * 1e6) / 1e6);
   return v.toLocaleString("en-PH", { maximumFractionDigits: 6 });
 }                                   // value as shown = value used by the filter
 // Summary row fed by each file; typed amounts on that row (Edit mode / carried from the last save) hide file changes
@@ -2186,10 +2197,11 @@ function renderEditor() {
   }).join("");
   const hdrRow = hi >= 0 ? fe.grid.rows[hi].vals : [];
   const yearCols = new Set(hdrRow.map((h, ci) => (typeof h === "string" && /year/i.test(h) ? fe.grid.c0 + ci : -1)).filter((x) => x >= 0));
+  const plain = plainCols(ws);
   const body = fe.pageRows.map((x, i) => `<tr class="${i < fe.pinned ? "pin" : ""}"><th class="rn" data-ri="${i}">${x.r + 1}</th>${x.vals.map((v, ci) => {
     const col = fe.grid.c0 + ci, addr = XLSX.utils.encode_cell({ r: x.r, c: col }), cls = addr in ed ? " edited" : addr in wr ? " written" : "";
     const fcell = ws[addr] && ws[addr].f;
-    return `<td class="fe-c${cls}${typeof v === "number" ? " num" : ""}${fcell ? " fx" : ""}" data-a="${addr}" data-i="${i}" data-c="${col}"${fcell ? ` title="=${escapeHtml(ws[addr].f)}"` : ""}>${escapeHtml(dispVal(v, yearCols.has(col)))}</td>`;
+    return `<td class="fe-c${cls}${typeof v === "number" ? " num" : ""}${fcell ? " fx" : ""}" data-a="${addr}" data-i="${i}" data-c="${col}"${fcell ? ` title="=${escapeHtml(ws[addr].f)}"` : ""}>${escapeHtml(dispVal(v, yearCols.has(col), plain.has(col)))}</td>`;
   }).join("")}</tr>`).join("");
   $("fe-grid").innerHTML = `<table><thead><tr><th class="rn"></th>${colHead}</tr></thead><tbody>${body}</tbody></table>`;
   if (fe.sel && (Math.max(fe.sel.a[0], fe.sel.b[0]) >= fe.pageRows.length)) fe.sel = null;
@@ -2261,7 +2273,7 @@ function applyCellValue(addr, text, old, opts = {}) {
   if (isF) {
     if (old && old.f && old.f.replace(/\s/g, "") === val.formula.replace(/\s/g, "")) return false;
     let v = old ? old.v : 0;
-    try { v = evalSimpleFormula(val.formula, ws); } catch (_) { /* Excel will calculate it */ }
+    try { v = evalSimpleFormula(val.formula, ws, editWorkbook(fe.k)); } catch (_) { /* Excel will calculate it */ }
     s.edits = s.edits || {}; s.edits[fe.sheet] = s.edits[fe.sheet] || {};
     s.edits[fe.sheet][addr] = { formula: val.formula };
     ws[addr] = { t: "n", f: val.formula, v };
@@ -2453,11 +2465,11 @@ function openFilter(col, btn) {
   const counts = new Map();
   base.forEach((x) => { const v = fkey(x.vals[ci]); counts.set(v, (counts.get(v) || 0) + 1); });
   const vals = [...counts.keys()].sort((a, b) => (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b, undefined, { numeric: true })));
-  const cur = flt[col];
+  const cur = flt[col], plain = plainCols(editWorkbook(fe.k).Sheets[fe.sheet]).has(col);
   pop.innerHTML = `<div class="fp-head"><b>Filter column ${XLSX.utils.encode_col(col)}</b><span class="muted">${vals.length.toLocaleString("en-PH")} values</span></div>
     <input type="text" class="fp-search" placeholder="Search values…">
     <label class="fp-all"><input type="checkbox" class="fp-allbox" ${!cur ? "checked" : ""}> (Select all)</label>
-    <div class="fp-list">${vals.slice(0, 2000).map((v, i) => `<label class="fp-item" data-t="${escapeHtml(v.toLowerCase())}"><input type="checkbox" data-v="${i}" ${!cur || cur.has(v) ? "checked" : ""}> ${v === "" ? "<i>(Blanks)</i>" : escapeHtml(/^-?\d+(\.\d+)?$/.test(v) ? dispVal(+v) : v)} <span class="muted">${counts.get(v)}</span></label>`).join("")}</div>
+    <div class="fp-list">${vals.slice(0, 2000).map((v, i) => `<label class="fp-item" data-t="${escapeHtml(v.toLowerCase())}"><input type="checkbox" data-v="${i}" ${!cur || cur.has(v) ? "checked" : ""}> ${v === "" ? "<i>(Blanks)</i>" : escapeHtml(/^-?\d+(\.\d+)?$/.test(v) ? dispVal(+v, false, plain) : v)} <span class="muted">${counts.get(v)}</span></label>`).join("")}</div>
     <div class="fp-foot"><button type="button" class="btn ghost small fp-clear">Clear filter</button><button type="button" class="btn ghost small fp-cancel">Cancel</button><button type="button" class="btn primary small fp-ok">OK</button></div>`;
   const r = btn.getBoundingClientRect(), m = pop.parentElement.getBoundingClientRect();
   pop.style.left = Math.max(8, Math.min(r.left - m.left - 220, m.width - 330)) + "px";
@@ -2491,64 +2503,118 @@ function afterFileEdit(k) {
    1. simple formulas on edited sheets: numbers, cell references, + - * /, ( ), SUM(...)   e.g. =SUM(B6:B29), =E2+F2-G2
    2. the Unit Disposal plan's own rules (ready-to-sell date + lag, then weekly SUMIFS / COUNTIFS)
    Anything else (IF, SUMIFS, other sheets, dates/text in arithmetic) keeps its last value. */
-function evalSimpleFormula(f, ws) {
-  const src = String(f).replace(/\$/g, "");
+// Small formula engine for the file editor: numbers, cell / range references (also on other sheets and whole
+// columns like 'Unreleased Checks'!$D:$D), + - * / &, SUM, SUMIFS and COUNTIFS. Anything else throws, and that
+// formula keeps its last value (Excel recalculates it when the file is opened).
+const XL_EPOCH = Date.UTC(1899, 11, 30);
+const serialOf = (d) => (Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds()) - XL_EPOCH) / DAY;
+function evalSimpleFormula(f, ws, wb) {
+  const src = String(f);
   let i = 0;
   const sp = () => { while (src[i] === " ") i++; };
-  const num = (addr) => {
-    const cl = ws[addr];
-    if (!cl || cl.v == null || cl.v === "") return 0;
-    if (typeof cl.v === "number") return cl.v;
-    throw 0;                                                    // a date or text in arithmetic: leave the formula alone
+  const sheetOf = (name) => { if (name == null) return ws; const s = wb && wb.Sheets[name]; if (!s) throw 0; return s; };
+  const cellV = (sh, addr) => { const cl = sh[addr]; return !cl || cl.v == null ? null : cl.v; };
+  const num = (v) => { if (v == null || v === "") return 0; if (typeof v === "number") return v; if (typeof v === "boolean") return +v; throw 0; };
+  // reference at the cursor: [sheet!]A1, [sheet!]A1:B9 or [sheet!]D:D
+  const REF = /^(?:'((?:[^']|'')+)'!|([A-Za-z0-9_.]+)!)?(\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?|\$?[A-Z]{1,3}:\$?[A-Z]{1,3})(?![\w(])/i;
+  function readRef() {
+    const m = REF.exec(src.slice(i));
+    if (!m) return null;
+    i += m[0].length;
+    const sh = sheetOf(m[1] != null ? m[1].replace(/''/g, "'") : m[2] != null ? m[2] : null), ref = m[3].replace(/\$/g, "").toUpperCase();
+    if (!ref.includes(":")) return { sh, cell: ref };
+    let [p, q] = ref.split(":");
+    if (/^[A-Z]+$/.test(p)) {                                     // whole column: used rows of that sheet
+      const rg = XLSX.utils.decode_range(sh["!ref"] || "A1");
+      p += rg.s.r + 1; q += rg.e.r + 1;
+    }
+    return { sh, range: XLSX.utils.decode_range(p + ":" + q) };
+  }
+  const cells = (r) => { const out = []; for (let R = r.range.s.r; R <= r.range.e.r; R++) for (let C = r.range.s.c; C <= r.range.e.c; C++) out.push(cellV(r.sh, XLSX.utils.encode_cell({ r: R, c: C }))); return out; };
+  const args = () => {                                           // after "NAME(": list of refs / values
+    const out = [];
+    for (;;) {
+      sp();
+      const save = i, r = readRef();
+      sp();
+      if (r && (src[i] === "," || src[i] === ")")) out.push(r); else { i = save; out.push({ val: concat() }); }
+      sp();
+      if (src[i] === ",") { i++; continue; }
+      if (src[i] === ")") { i++; return out; }
+      throw 0;
+    }
   };
-  const range = (a, b) => {
-    const r = XLSX.utils.decode_range(a + ":" + b); let s = 0;
-    for (let R = r.s.r; R <= r.e.r; R++) for (let C = r.s.c; C <= r.e.c; C++) { const cl = ws[XLSX.utils.encode_cell({ r: R, c: C })]; if (cl && typeof cl.v === "number") s += cl.v; }
+  // Excel criteria: ">=46307", "<>0", "AGENCY", 5, a date ...
+  const crit = (c) => {
+    let op = "=", s = c;
+    if (typeof c === "string") { const m = /^(>=|<=|<>|>|<|=)?(.*)$/s.exec(c); op = m[1] || "="; s = m[2]; }
+    const n = c instanceof Date ? serialOf(c) : typeof s === "number" ? s : s !== "" && !isNaN(+s) ? +s : null;
+    const re = typeof s === "string" && n == null ? new RegExp("^" + s.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i") : null;
+    return (v) => {
+      const x = v instanceof Date ? serialOf(v) : v;
+      if (n != null) {
+        if (typeof x !== "number") return op === "<>";
+        return op === "=" ? x === n : op === "<>" ? x !== n : op === ">" ? x > n : op === "<" ? x < n : op === ">=" ? x >= n : x <= n;
+      }
+      const t = x == null ? "" : String(x), hit = s === "" ? t === "" : re.test(t);
+      return op === "<>" ? !hit : op === "=" ? hit : false;
+    };
+  };
+  const ifs = (list, sumR) => {                                   // [rangeRef, criterion] pairs
+    if (list.length % 2 || list.some((x, k) => (k % 2 === 0 ? !x.range : false))) throw 0;
+    const cols = [];
+    for (let k = 0; k < list.length; k += 2) cols.push([cells(list[k]), crit(list[k + 1].val !== undefined ? list[k + 1].val : cellV(list[k + 1].sh, list[k + 1].cell))]);
+    const vals = sumR ? cells(sumR) : null, n = cols[0][0].length;
+    if (cols.some(([v]) => v.length !== n) || (vals && vals.length !== n)) throw 0;
+    let s = 0;
+    for (let r = 0; r < n; r++) if (cols.every(([v, ok]) => ok(v[r]))) s += vals ? (typeof vals[r] === "number" ? vals[r] : 0) : 1;
     return s;
   };
   function primary() {
     sp();
     const rest = src.slice(i);
-    if (src[i] === "(") { i++; const v = expr(); sp(); if (src[i] !== ")") throw 0; i++; return v; }
-    if (src[i] === "-") { i++; return -primary(); }
+    if (src[i] === "(") { i++; const v = concat(); sp(); if (src[i] !== ")") throw 0; i++; return v; }
+    if (src[i] === "-") { i++; return -num(primary()); }
     if (src[i] === "+") { i++; return primary(); }
+    if (src[i] === '"') { const m = /^"((?:[^"]|"")*)"/.exec(rest); if (!m) throw 0; i += m[0].length; return m[1].replace(/""/g, '"'); }
     let m = /^\d+(\.\d+)?([eE][-+]?\d+)?/.exec(rest);
-    if (m) { i += m[0].length; return parseFloat(m[0]); }
-    if (/^SUM\(/i.test(rest)) {
-      i += 4; let s = 0;
-      for (;;) {
-        sp();
-        const r = /^([A-Z]{1,3}\d+):([A-Z]{1,3}\d+)/i.exec(src.slice(i));
-        if (r) { i += r[0].length; s += range(r[1].toUpperCase(), r[2].toUpperCase()); } else s += expr();
-        sp();
-        if (src[i] === ",") { i++; continue; }
-        if (src[i] === ")") { i++; break; }
-        throw 0;
-      }
-      return s;
+    if (m && !/^\d+:/.test(rest)) { i += m[0].length; return parseFloat(m[0]); }
+    m = /^(SUM|SUMIFS|COUNTIFS)\(/i.exec(rest);
+    if (m) {
+      i += m[0].length;
+      const fn = m[1].toUpperCase(), a = args();
+      if (fn === "SUM") return a.reduce((s, x) => s + (x.range ? cells(x).reduce((t, v) => t + (typeof v === "number" ? v : 0), 0) : x.cell ? num(cellV(x.sh, x.cell)) : num(x.val)), 0);
+      if (fn === "SUMIFS") { if (!a[0].range) throw 0; return ifs(a.slice(1), a[0]); }
+      return ifs(a, null);
     }
-    m = /^[A-Z]{1,3}\d+(?![\w!(])/i.exec(rest);
-    if (m) { i += m[0].length; return num(m[0].toUpperCase()); }
+    const r = readRef();
+    if (r && r.cell) return cellV(r.sh, r.cell);
     throw 0;
   }
-  function term() { let v = primary(); for (;;) { sp(); if (src[i] === "*") { i++; v *= primary(); } else if (src[i] === "/") { i++; v /= primary(); } else return v; } }
-  function expr() { let v = term(); for (;;) { sp(); if (src[i] === "+") { i++; v += term(); } else if (src[i] === "-") { i++; v -= term(); } else return v; } }
-  const v = expr(); sp();
-  if (i < src.length || !isFinite(v)) throw 0;
-  return v;
+  const valOf = (v) => (v instanceof Date ? serialOf(v) : v);
+  function term() { let v = primary(); for (;;) { sp(); if (src[i] === "*") { i++; v = num(v) * num(primary()); } else if (src[i] === "/") { i++; v = num(v) / num(primary()); } else return v; } }
+  function expr() { let v = term(); for (;;) { sp(); if (src[i] === "+") { i++; v = num(v) + num(term()); } else if (src[i] === "-") { i++; v = num(v) - num(term()); } else return v; } }
+  function concat() { let v = expr(); for (;;) { sp(); if (src[i] === "&") { i++; const w = expr(); v = String(valOf(v) ?? "") + String(valOf(w) ?? ""); } else return v; } }
+  const v = concat(); sp();
+  if (i < src.length) throw 0;
+  const out = v == null ? 0 : v;
+  if (typeof out !== "number" || !isFinite(out)) throw 0;          // dates / text results: leave the cell as it is
+  return out;
 }
-function recalcSheet(ws, track) {
-  if (!ws) return;
+function recalcSheet(ws, track, wb) {
+  if (!ws) return false;
   const fs = Object.keys(ws).filter((a) => a[0] !== "!" && ws[a] && ws[a].f);
+  let any = false;
   for (let pass = 0; pass < 8; pass++) {                      // a few passes so formulas that use other formulas settle
     let changed = false;
     for (const a of fs) {
       let v;
-      try { v = evalSimpleFormula(ws[a].f, ws); } catch (_) { continue; }
-      if (ws[a].v !== v) { ws[a].v = v; ws[a].t = "n"; delete ws[a].w; changed = true; if (track) track.add(a); }
+      try { v = evalSimpleFormula(ws[a].f, ws, wb); } catch (_) { continue; }
+      if (Math.abs((typeof ws[a].v === "number" ? ws[a].v : NaN) - v) > 1e-9 || typeof ws[a].v !== "number") { ws[a].v = v; ws[a].t = "n"; delete ws[a].w; changed = true; any = true; if (track) track.add(a); }
     }
     if (!changed) break;
   }
+  return any;
 }
 // Unit Disposal plan: Expected cash-in = MAX(projected month, orig ORCR date, plan date) + lag (14 if ORCR pending, else 7);
 // Weekly "Disposal proceeds" = SUMIFS(Proceeds, cash-in within From–To); "Units — cash received" = COUNTIFS(...).
@@ -2615,7 +2681,17 @@ function recalcEdited(k) {
   if (k === "ds") recalcUnitPlan(wb, s.edits, (sheet, addr) => tr(sheet).add(addr));
   const sheets = new Set(Object.keys(s.edits || {}));
   if (k === "ds") wb.SheetNames.filter((n) => /weekly/i.test(n)).forEach((n) => sheets.add(n));
-  sheets.forEach((n) => recalcSheet(wb.Sheets[n], tr(n)));
+  // sheets with formulas that read one of these sheets (e.g. Weekly Schedule = SUMIFS over 'Unreleased Checks')
+  const reads = (n, t) => Object.keys(wb.Sheets[n]).some((a) => a[0] !== "!" && wb.Sheets[n][a] && wb.Sheets[n][a].f && wb.Sheets[n][a].f.includes(t + "!"));
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const n of wb.SheetNames) if (!sheets.has(n) && [...sheets].some((t) => reads(n, `'${t.replace(/'/g, "''")}'`) || (/^[A-Za-z0-9_.]+$/.test(t) && reads(n, t)))) { sheets.add(n); grew = true; }
+  }
+  for (let round = 0; round < 4; round++) {
+    let changed = false;
+    sheets.forEach((n) => { if (recalcSheet(wb.Sheets[n], tr(n), wb)) changed = true; });
+    if (!changed) break;
+  }
 }
 
 function reingest(k) {
