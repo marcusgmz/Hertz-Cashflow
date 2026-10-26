@@ -529,7 +529,7 @@ function handleDisposal(file) {
       $("mstat-ds").innerHTML = `<b>${escapeHtml(file.name)}</b><br>${units ? units + " units · " : ""}${fmtNum(tot)} disposal proceeds · sheet "${escapeHtml(res.sheet)}"`;
       renderDisposalMonths();
       saved = false;
-      if (report || state.ar.rows.length) refresh(); else renderFileList();
+      refresh(); renderFileList();
       $("review").classList.remove("hidden"); $("empty").classList.add("hidden"); $("tabs").classList.remove("hidden");
       showTab("summary");
     } catch (err) {
@@ -636,7 +636,7 @@ function handleCashOut(key, file) {
       $("mstat-" + key).innerHTML = `<b>${escapeHtml(file.name)}</b><br>${state[key].info}` + (res.undated ? `<br><span class="warn">${fmtNum(res.undated)} without a clearing date (not placed)</span>` : "");
       renderCashOutSources();
       saved = false;
-      if (report || state.ar.rows.length) refresh(); else renderFileList();
+      refresh(); renderFileList();
       $("review").classList.remove("hidden"); $("empty").classList.add("hidden"); $("tabs").classList.remove("hidden");
       showTab("summary");
     } catch (err) {
@@ -955,8 +955,10 @@ function rowTotal(row, c) { return row.total ? c[row.total] : c.v[row.k].reduce(
 /* ============================================================
    Rendering
    ============================================================ */
+// The Summary is shown as soon as ANY source file is uploaded (AR Aging is not required first).
+function hasUploads() { return !!(state.ar.rows.length || state.ap.rows.length || ["cf", "ds", "ln", "uc", "po"].some((k) => state[k].buffer)); }
 function refresh() {
-  if (!$("opt-start").value || (!state.ar.rows.length && !state.ap.rows.length)) return;
+  if (!$("opt-start").value || !hasUploads()) return;
   report = buildBase();
   $("review").classList.remove("hidden");
   $("empty").classList.add("hidden");
@@ -2623,7 +2625,7 @@ function reingest(k) {
     } else if (k === "cf") { const res = parseCashflowReport(wb); s.rows = res.rows; renderRetail(); }
     else if (k === "ds") { s.rows = parseUnitDisposals(wb).rows; renderDisposalMonths(); }
     else if (CO_META[k]) { const res = CO_META[k].parse(wb); s.byDate = res.byDate; s.info = coInfo(res); renderCashOutSources(); }
-    if (report || state.ar.rows.length) refresh();
+    refresh();
   } catch (e) { toast(`${KIND_NAME[k]}: the edited file can no longer be read — ${escapeHtml(e.message)}`, true, 7000); }
 }
 
