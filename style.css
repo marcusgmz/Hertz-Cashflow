@@ -453,3 +453,6 @@ td.rem { white-space: normal !important; min-width: 180px; max-width: 320px; col
 @keyframes spin { to { transform: rotate(360deg); } }
 #btn-save:disabled { opacity: .85; }
 .chip.flash { background: #d9f2e1; color: #17803f; font-weight: 600; transition: background .3s; }
+
+/* version label under the logo */
+.app-version { font-size: 11px; color: #9aa1b2; margin: -6px 0 10px 2px; letter-spacing: .02em; }
