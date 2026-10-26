@@ -1255,6 +1255,15 @@ function renderNotes() {
   $("notes").textContent = notes.join(" ");
 }
 
+// Bank balances typed in Setup are remembered by this browser (each computer keeps its own) and filled in next time.
+const ACCT_KEY = "cf-accounts";
+function saveAccounts() { try { localStorage.setItem(ACCT_KEY, JSON.stringify(accounts)); } catch (_) {} }
+function restoreAccounts() {
+  try {
+    const a = JSON.parse(localStorage.getItem(ACCT_KEY) || "null");
+    if (Array.isArray(a) && a.length) accounts.splice(0, accounts.length, ...a.map((x) => ({ bank: String(x.bank || ""), no: String(x.no || ""), purpose: String(x.purpose || ""), bal: +x.bal || 0 })));
+  } catch (_) {}
+}
 function renderAccounts() {
   const tb = document.querySelector("#tbl-accounts tbody");
   tb.innerHTML = "";
@@ -1265,9 +1274,9 @@ function renderAccounts() {
       <td><button type="button" class="btn ghost small" data-del>✕</button></td>`;
     tr.querySelectorAll("input").forEach((inp) => (inp.oninput = () => {
       a[inp.dataset.k] = inp.dataset.k === "bal" ? parseFloat(inp.value) || 0 : inp.value;
-      saved = false; refresh();
+      saveAccounts(); saved = false; refresh();
     }));
-    tr.querySelector("[data-del]").onclick = () => { accounts.splice(i, 1); renderAccounts(); refresh(); };
+    tr.querySelector("[data-del]").onclick = () => { accounts.splice(i, 1); saveAccounts(); renderAccounts(); refresh(); };
     tb.appendChild(tr);
   });
   $("bal-total").textContent = fmtNum(acctTotal());
@@ -1980,7 +1989,8 @@ function showTab(name) {
 }
 document.querySelectorAll(".tab").forEach((t) => (t.onclick = () => showTab(t.dataset.tab)));
 $("btn-bal").onclick = () => { showTab("setup"); $("bal-panel").scrollIntoView({ behavior: "smooth", block: "center" }); };
-$("btn-add-acct").onclick = () => { accounts.push({ bank: "", no: "", purpose: "", bal: 0 }); renderAccounts(); };
+$("btn-add-acct").onclick = () => { accounts.push({ bank: "", no: "", purpose: "", bal: 0 }); saveAccounts(); renderAccounts(); };
+restoreAccounts();
 renderAccounts();
 restoreFolder();
 {
