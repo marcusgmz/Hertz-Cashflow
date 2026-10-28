@@ -10,3 +10,6 @@ Weekly 13-week cash flow forecast for Hertz Philippines (browser app, no server)
 5. Review / edit the Summary (or the uploaded files via **Uploaded files** in the sidebar), then **Save summary**. The saved file also holds a copy of each source sheet (AR Corporate, Cash Flow Report, Unit Disposals, Loan Payments, Unreleased Checks, Projected Payments) and a Bank Balances sheet; the Summary amounts are formulas that point to them.
 
 Company data (FILES, source Excel files) is not stored in this repository.
+
+## Several people at the same time (V3.6)
+Everyone connects the same shared **FILES** folder on the LAN. Each part (AR Aging, Cash Flow Report, Unit Disposals, Loans, Unreleased Checks, Projected payments, bank balances, typed amounts) is saved separately in `FILES/Current`; **Save summary** combines everyone's latest work into `Cashflow Summary/Cashflow_Summary_LATEST.xlsx`, and **Finalize week** keeps a dated copy. No data is sent to GitHub — the browser reads and writes the LAN folder directly.

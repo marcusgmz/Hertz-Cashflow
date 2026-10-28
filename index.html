@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=3.5.5">
+<link rel="stylesheet" href="style.css?v=3.6.10">
 </head>
 <body>
 <div class="shell">
@@ -16,7 +16,7 @@
   <!-- ============ SIDEBAR: logo, navigation, folder, uploads ============ -->
   <aside class="sidebar">
     <img class="logo-img" src="logo.png" alt="Hertz">
-    <div class="app-version" title="Saved summaries include the detail sheets (AR Corporate, Cash Flow Report, Unit Disposals, Cash Out, Bank Balances)">Version 3.5</div>
+    <div class="app-version" title="Several people can work at the same time; Save combines everyone's work (FILES/Current)">Version 3.6</div>
 
     <div class="side-group">
       <div class="side-title">Menu</div>
@@ -58,7 +58,7 @@
     </div>
 
     <div class="side-group side-bottom">
-      <button id="btn-user" class="folder-btn user-btn" type="button" title="Your name (shown to others while you prepare the cashflow)"><span>👤</span><span id="user-label">Set your name</span></button>
+      <button id="btn-user" class="folder-btn user-btn" type="button" title="Your name (recorded with every part you save)"><span>👤</span><span id="user-label">Set your name</span></button>
       <button id="btn-folder" class="folder-btn" title="Connect folder"><span class="dot" id="folder-dot"></span><span id="folder-label">Connect folder</span></button>
       <span id="folder-text" class="hidden"></span>
     </div>
@@ -76,6 +76,8 @@
       <div class="top-actions">
         <span class="chip" id="last-saved" title=""></span>
         <button class="btn outline" id="btn-edit" disabled>✎ Edit</button>
+        <button class="btn outline" id="btn-refresh" title="Load everyone's latest saved updates">⟳ Refresh</button>
+        <button class="btn outline" id="btn-final" disabled title="Save everything and keep a dated copy of the summary as this week's record">Finalize week</button>
         <button class="btn primary" id="btn-save" disabled>Save summary</button>
       </div>
     </header>
@@ -288,7 +290,7 @@
 
             <div class="data-card wide" id="bal-panel">
               <div class="data-head">
-                <div><h2>Cash balances</h2><p class="muted">The total becomes the Beginning Balance of Week 1. What you type here is remembered on this computer and filled in automatically next time.</p></div>
+                <div><h2>Cash balances</h2><p class="muted">The total becomes the Beginning Balance of Week 1. Type them here or upload the <b>Bank Balances</b> file (Upload). The balances are shared: Save summary updates them for everyone.</p><p class="muted" id="bank-by"></p></div>
                 <div class="bal-total">Total <strong id="bal-total">-</strong></div>
               </div>
               <div class="table-wrap">
@@ -317,6 +319,11 @@
     </div>
     <p class="muted">Choose or drag a file into each slot. The summary preview updates automatically. Copying files into "Uploaded Files" is controlled in Setup (off by default).</p>
     <div class="um-list">
+      <div class="um-row drop" id="drop-bk">
+        <div class="um-info"><div class="um-label">Bank Balances <span class="muted">(Beginning Balance of Week 1 · replaces Setup &gt; Cash balances)</span></div><div class="um-status" id="mstat-bk">No file chosen</div></div>
+        <label class="btn outline small" for="file-bk">Choose file</label>
+        <input type="file" id="file-bk" accept=".xlsx,.xls,.xlsm,.csv" hidden>
+      </div>
       <div class="um-row drop" id="drop-ar">
         <div class="um-info"><div class="um-label">AR Aging</div><div class="um-status" id="mstat-ar">No file chosen</div></div>
         <label class="btn outline small" for="file-ar">Choose file</label>
@@ -376,7 +383,7 @@
 <div class="modal-backdrop hidden" id="fe-modal" role="dialog" aria-modal="true" aria-labelledby="fe-title">
   <div class="modal modal-editor">
     <div class="modal-head">
-      <div><h2 id="fe-title">Edit file</h2><p class="muted" id="fe-sub"></p></div>
+      <div><h2 id="fe-title">Edit file</h2><p class="muted" id="fe-sub"></p><button type="button" class="btn ghost small hidden" id="fe-link">Link original file…</button></div>
       <button class="icon-btn" id="fe-close" type="button" aria-label="Close">✕</button>
     </div>
     <div class="fe-tabs" id="fe-tabs"></div>
@@ -401,6 +408,6 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
-<script src="app.js?v=3.5.5"></script>
+<script src="app.js?v=3.6.10"></script>
 </body>
 </html>

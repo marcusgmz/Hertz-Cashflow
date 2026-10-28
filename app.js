@@ -97,7 +97,7 @@ const HAS_FS = "showDirectoryPicker" in window;
 // why folder access may be unavailable (shown to the user instead of a dead button)
 function fsUnavailableReason() {
   if (HAS_FS) return "";
-  if (!window.isSecureContext) return `This page was opened as ${location.protocol}//${location.host || ""} — browsers turn off folder access on plain "http" addresses. Open the system from its file path instead (e.g. Z:\\Hertz\\V3.5\\index.html or \\\\SERVER\\Hertz\\V3.5\\index.html), or use https.`;
+  if (!window.isSecureContext) return `This page was opened as ${location.protocol}//${location.host || ""} — browsers turn off folder access on plain "http" addresses. Open the system from its file path instead (e.g. Z:\\Hertz\\V3.6\\index.html or \\\\SERVER\\Hertz\\V3.6\\index.html), or use https.`;
   return "This browser cannot save into folders. Use Google Chrome or Microsoft Edge (up to date).";
 }
 
@@ -135,7 +135,16 @@ function showFolder(status) {
   btn.title = txt.textContent;
 }
 
+// The folder window can take a few seconds to appear on a network drive (or open behind the browser):
+// a second click while it is open must not start another one.
+let pickerOpen = false;
 async function connectFolder() {
+  if (pickerOpen) { toast("The folder window is already open<small>On the network drive it can take a few seconds to appear, or it may be behind this browser window (check the taskbar). Choose the FILES folder there.</small>", false, 7000); return; }
+  pickerOpen = true; $("btn-folder").disabled = true; $("folder-label").textContent = "Choosing folder…";
+  try { await connectFolderInner(); }
+  finally { pickerOpen = false; $("btn-folder").disabled = false; if ($("folder-label").textContent === "Choosing folder…") showFolder(rootDir && baseDir ? "ok" : rootDir ? "reconnect" : undefined); }
+}
+async function connectFolderInner() {
   try {
     if (rootDir && (await rootDir.queryPermission({ mode: "readwrite" })) !== "granted") {
       if ((await rootDir.requestPermission({ mode: "readwrite" })) === "granted") { await onFolderReady(); return; }
@@ -146,6 +155,7 @@ async function connectFolder() {
     await onFolderReady();
   } catch (e) {
     if (e.name === "AbortError") return;
+    if (/already active/i.test(e.message || "")) { toast("The folder window is already open<small>It may be behind this browser window (check the taskbar). Choose the FILES folder there.</small>", false, 7000); return; }
     const tips = {
       SecurityError: "The browser or a company policy blocks folder access on this page. Open the system from its file path in Chrome/Edge (not an http address), or ask IT to allow the File System Access setting.",
       NotAllowedError: "Permission was not given. Click Connect folder again and choose Allow / Edit files.",
@@ -162,9 +172,7 @@ async function onFolderReady() {
   await baseDir.getDirectoryHandle(UPLOAD_DIR, { create: true });
   await baseDir.getDirectoryHandle(SUMMARY_DIR, { create: true });
   showFolder("ok");
-  await loadLatestSummary();
-  sessionBaseSummary = lastSaved ? lastSaved.name : null;
-  await refreshLock();
+  await openShared();
   toast(`Folder connected<small>"${UPLOAD_DIR}" and "${SUMMARY_DIR}" are ready inside ${escapeHtml(baseDir.name)}.</small>`);
   for (const k of ["ar", "ap"]) if (state[k].file && !state[k].saved) await saveOriginal(k); // flush files uploaded before connecting
 }
@@ -184,9 +192,20 @@ async function onFolderReady_silent() {
   await baseDir.getDirectoryHandle(UPLOAD_DIR, { create: true });
   await baseDir.getDirectoryHandle(SUMMARY_DIR, { create: true });
   showFolder("ok");
+  await openShared();
+}
+// Load everyone's latest parts (FILES/Current). The first time (nothing shared yet) the last saved summary is used as before.
+async function openShared() {
+  await baseDir.getDirectoryHandle(CURRENT_DIR, { create: true });
+  showProgress("Loading everyone's latest updates…");
+  try { sharedFound = await loadShared(); }
+  catch (e) { toast("Could not load the shared updates:<small>" + escapeHtml(e.message) + "</small>", true, 10000); }
+  showProgress("Checking the last saved summary…");
   await loadLatestSummary();
-  sessionBaseSummary = lastSaved ? lastSaved.name : null;
-  await refreshLock();
+  if (sharedFound) { renderNews(); if (report) showTab("summary"); } else showNothingShared();
+  clearInterval(pollTimer);
+  pollTimer = setInterval(checkNews, 60000);
+  updateSaveState();
 }
 async function openDir(path) {
   let dir = baseDir;
@@ -219,6 +238,21 @@ const FIELD_LABELS = { party: "Customer / Vendor", due: "Due date", amount: "Amo
 const AR_ONLY_FIELDS = ["type", "vat", "inv", "proj", "rem"];
 const KIND_LABEL = { ar: "AR_Aging", ap: "AP_Aging", cf: "CashFlow_Report", ds: "Disposal_Schedule", ln: "Loan_Payment_Schedule", uc: "Unreleased_Checks", po: "Projected_Cash_Outflow" };
 
+// Reads the file, waits for its handler, then marks the part as changed by this user (unless it came from FILES/Current).
+function readInto(reader, file, kind) {
+  return new Promise((res) => {
+    const h = reader.onload;
+    reader.onload = async (e) => {
+      try { await h(e); } finally {
+        const s = state[kind];
+        if (s && s.buffer) { if (sharedLoading) Object.assign(s, { dirty: false, copySaved: true, saved: true, handle: null }); else { s.dirty = true; s.sharedBy = null; } }
+        res();
+      }
+    };
+    reader.onerror = () => res();
+    reader.readAsArrayBuffer(file);
+  });
+}
 function handleFile(kind, file) {
   const info = $("info-" + kind);
   const reader = new FileReader();
@@ -244,7 +278,57 @@ function handleFile(kind, file) {
       info.innerHTML = `<div class="err">Could not read this file: ${escapeHtml(err.message)}</div>`;
     }
   };
-  reader.readAsArrayBuffer(file);
+  return readInto(reader, file, kind);
+}
+
+/* ============================================================
+   Bank Balances file -> Setup > Cash balances (Beginning Balance of Week 1)
+   Layout: a heading row with "Bank" and "Balance" (also "Account no." / "Purpose"), one row per account, then "Total".
+   ============================================================ */
+let bankUpload = null;          // { file, buffer, copied } — the uploaded Bank Balances file (copied to Uploaded Files on Save)
+function parseBankBalances(wb) {
+  for (const name of wb.SheetNames) {
+    const g = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: null });
+    const t = (c) => (typeof c === "string" ? c.trim().toLowerCase() : "");
+    const hi = g.slice(0, 30).findIndex((r) => r.some((c) => t(c) === "bank") && r.some((c) => /balance/.test(t(c))));
+    if (hi < 0) continue;
+    const H = g[hi].map(t), col = (re) => H.findIndex((x) => re.test(x));
+    const iB = col(/^bank$/), iN = col(/account/), iP = col(/purpose/), iV = col(/balance/);
+    const rows = [];
+    for (const r of g.slice(hi + 1)) {
+      const bank = r[iB] == null ? "" : String(r[iB]).trim();
+      if (/^(grand\s*)?total/i.test(bank)) break;
+      const v = typeof r[iV] === "number" ? r[iV] : parseNumber(r[iV]);
+      if (!bank && (v == null || isNaN(v))) continue;
+      rows.push({ bank, no: iN >= 0 && r[iN] != null ? String(r[iN]).trim() : "", purpose: iP >= 0 && r[iP] != null ? String(r[iP]).trim() : "", bal: isNaN(v) || v == null ? 0 : Math.round(v * 100) / 100 });
+    }
+    if (rows.length) return { rows, sheet: name };
+  }
+  throw new Error('No table with "Bank" and "Balance" headings was found.');
+}
+function handleBankFile(file) {
+  const reader = new FileReader();
+  return new Promise((res) => {
+    reader.onload = (e) => {
+      try {
+        const res2 = parseBankBalances(XLSX.read(e.target.result, { type: "array", cellDates: true }));
+        accounts.splice(0, accounts.length, ...res2.rows);
+        bankUpload = { file, buffer: e.target.result, copied: false };
+        saveAccounts();                                    // shared with everyone on Save summary
+        renderAccounts();
+        $("drop-bk").classList.add("loaded");
+        $("mstat-bk").innerHTML = `<b>${escapeHtml(file.name)}</b><br>${res2.rows.length} account${res2.rows.length === 1 ? "" : "s"} · total ${fmtNum(acctTotal())} · sheet "${escapeHtml(res2.sheet)}"`;
+        saved = false;
+        if (report || hasUploads()) refresh(); else updateSaveState();
+        toast(`Bank balances loaded from ${escapeHtml(file.name)}<small>${res2.rows.length} accounts · Beginning Balance of Week 1 = ${fmtNum(acctTotal())}. Click Save summary to share them.</small>`, false, 7000);
+      } catch (err) {
+        $("mstat-bk").innerHTML = `<span class="err">Could not read this file: ${escapeHtml(err.message)}</span>`;
+      }
+      res();
+    };
+    reader.onerror = () => res();
+    reader.readAsArrayBuffer(file);
+  });
 }
 
 /* ============================================================
@@ -293,7 +377,7 @@ function handleCashflowReport(file) {
       $("mstat-cf").innerHTML = `<span class="err">Could not read this file: ${escapeHtml(err.message)}</span>`;
     }
   };
-  reader.readAsArrayBuffer(file);
+  return readInto(reader, file, "cf");
 }
 
 const compactPeso = (n) => (Math.abs(n) >= 1e6 ? (n / 1e6).toFixed(2) + "M" : Math.abs(n) >= 1e3 ? (n / 1e3).toFixed(0) + "K" : n.toFixed(0));
@@ -536,7 +620,7 @@ function handleDisposal(file) {
       $("mstat-ds").innerHTML = `<span class="err">Could not read this file: ${escapeHtml(err.message)}</span>`;
     }
   };
-  reader.readAsArrayBuffer(file);
+  return readInto(reader, file, "ds");
 }
 
 /* ============================================================
@@ -643,7 +727,7 @@ function handleCashOut(key, file) {
       $("mstat-" + key).innerHTML = `<span class="err">Could not read this file: ${escapeHtml(err.message)}</span>`;
     }
   };
-  reader.readAsArrayBuffer(file);
+  return readInto(reader, file, key);
 }
 function renderCashOutSources() {
   const rows = Object.entries(CO_META).map(([k, m]) => {
@@ -655,7 +739,7 @@ function renderCashOutSources() {
   $("co-sources").innerHTML = `<table><thead><tr><th>Cash Out row</th><th>Source</th><th>Contents</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
   $("co-sources").querySelectorAll("[data-coclear]").forEach((b) => (b.onclick = () => {
     const k = b.dataset.coclear;
-    Object.assign(state[k], { byDate: {}, file: null, info: "", from: "", rows: [] });
+    Object.assign(state[k], { byDate: {}, file: null, buffer: null, info: "", from: "", rows: [], dirty: true, removed: true });
     $("drop-" + k).classList.remove("loaded"); $("mstat-" + k).textContent = "No file chosen";
     renderCashOutSources(); saved = false; if (report) refresh();
   }));
@@ -956,7 +1040,10 @@ function rowTotal(row, c) { return row.total ? c[row.total] : c.v[row.k].reduce(
    Rendering
    ============================================================ */
 // The Summary is shown as soon as ANY source file is uploaded (AR Aging is not required first).
-function hasUploads() { return !!(state.ar.rows.length || state.ap.rows.length || ["cf", "ds", "ln", "uc", "po"].some((k) => state[k].buffer)); }
+function hasUploads() {
+  return !!(state.ar.rows.length || state.ap.rows.length || ["cf", "ds", "ln", "uc", "po"].some((k) => state[k].buffer)
+    || state.ds.rows.length || ["ln", "uc", "po"].some((k) => Object.keys(state[k].byDate).length));   // also schedules kept from the last summary
+}
 function refresh() {
   if (!$("opt-start").value || !hasUploads()) return;
   report = buildBase();
@@ -1014,7 +1101,7 @@ function renderSummary() {
         : `<td class="indent"><span class="cr-handle" title="Drag to move this row">⋮⋮</span> ${escapeHtml(cr.name || "(unnamed row)")}${cr.sign < 0 ? ' <span class="muted">(deduction)</span>' : ""}</td>`;
       const cells = c.v[row.k].map((val, i) => editing
         ? `<td><input type="number" step="0.01" min="0" value="${cr.vals[wkIso(i)] ?? ""}" data-custom="${cr.id}" data-i="${i}" placeholder="0.00"></td>`
-        : `<td data-cell="${row.k}:${i}" class="${val < 0 ? "neg" : ""}">${fmtNum(val)}</td>`).join("");
+        : `<td data-cell="${row.k}:${i}" class="${val < 0 ? "neg" : ""}"${cr.vals[wkIso(i)] != null ? ` title="${escapeHtml(typedTip(row.k, wkIso(i)))}"` : ""}>${fmtNum(val)}</td>`).join("");
       const t = rowTotal(row, c);
       return `<tr class="${row.cls}" data-key="${row.k}">${labelCell}${cells}<td data-cell="${row.k}:t" class="${t < 0 ? "neg" : ""}">${fmtNum(t)}</td></tr>`;
     }
@@ -1025,7 +1112,8 @@ function renderSummary() {
       }
       const edited = row.edit && overrides[row.k] && overrides[row.k][wkIso(i)] !== undefined;
       const click = row.k === "arCorp" ? " clickable" : "";
-      return `<td data-cell="${row.k}:${i}" ${click ? 'title="Click to see the invoices behind this amount"' : ""} class="${val < 0 ? "neg" : ""} ${edited ? "edited" : ""}${click}">${fmtNum(val)}</td>`;
+      const tip = edited ? typedTip(row.k, wkIso(i)) : click ? "Click to see the invoices behind this amount" : "";
+      return `<td data-cell="${row.k}:${i}" ${tip ? `title="${escapeHtml(tip)}"` : ""} class="${val < 0 ? "neg" : ""} ${edited ? "edited" : ""}${click}">${fmtNum(val)}</td>`;
     }).join("");
     const t = rowTotal(row, c);
     return `<tr class="${row.cls}" ${row.drop ? `data-drop="${row.drop}"` : `data-key="${row.k}"`}><td class="${row.cls.includes("indent") ? "indent" : ""}">${row.label}</td>${cells}<td data-cell="${row.k}:t" ${row.k === "arCorp" ? 'title="Click to see all invoices"' : ""} class="${t < 0 ? "neg" : ""}${row.k === "arCorp" ? " clickable" : ""}">${fmtNum(t)}</td></tr>`;
@@ -1257,7 +1345,7 @@ function renderNotes() {
 
 // Bank balances typed in Setup are remembered by this browser (each computer keeps its own) and filled in next time.
 const ACCT_KEY = "cf-accounts";
-function saveAccounts() { try { localStorage.setItem(ACCT_KEY, JSON.stringify(accounts)); } catch (_) {} }
+function saveAccounts() { bankDirty = true; try { localStorage.setItem(ACCT_KEY, JSON.stringify(accounts)); } catch (_) {} renderBankInfo(); }
 function restoreAccounts() {
   try {
     const a = JSON.parse(localStorage.getItem(ACCT_KEY) || "null");
@@ -1309,11 +1397,12 @@ function updateSaveState() {
   $("btn-edit").disabled = !report;
   $("btn-add-row").disabled = !report;
   if (!report) { btn.disabled = true; return; }
-  const same = lastSaved && lastSaved.sig === summarySignature();
-  const busy = typeof lockedByOther === "function" && lockedByOther();
-  btn.disabled = !!same || busy;
-  btn.textContent = busy ? "In use by " + lockInfo.user : same ? "Saved ✓ (no changes)" : "Save summary";
-  btn.title = busy ? "Someone else is preparing the cashflow — saving is disabled (see the banner at the top)." : same ? "This summary is identical to the latest saved file. Upload a new file or make an edit to save again." : "";
+  const pending = typeof SHARED_KINDS !== "undefined" && (SHARED_KINDS.some((k) => state[k].dirty || state[k].syncOriginal) || bankDirty || (typedBase && typedChanges(typedNow(), typedBase).length > 0));
+  const same = !pending && lastSaved && lastSaved.sig === summarySignature();
+  btn.disabled = !!same;
+  btn.textContent = same ? "Saved ✓ (no changes)" : "Save summary";
+  btn.title = same ? "Nothing changed since the last save. Upload a new file or make an edit to save again." : "Saves the parts you changed for everyone, and updates Cashflow_Summary_LATEST.xlsx with everyone's latest work.";
+  if ($("btn-final")) $("btn-final").disabled = !report;
 }
 
 // Newest file in "Cashflow Summary" (names sort by date), plus the fingerprint stored inside it.
@@ -1324,27 +1413,28 @@ async function loadLatestSummary() {
     const names = [];
     for await (const [n, h] of dir.entries()) if (h.kind === "file" && /^Cashflow_Summary_.*\.xlsx$/i.test(n)) names.push(n);
     names.sort();
-    const latest = names.pop();
+    const latest = names.includes(LATEST_NAME) ? LATEST_NAME : names.pop();
     if (latest) {
       const f = await (await dir.getFileHandle(latest)).getFile();
       const ab = await f.arrayBuffer();
       let wb = XLSX.read(ab, { type: "array", bookProps: true });
       if (!/cashflow-sig:/.test((wb.Props && wb.Props.Comments) || "")) wb = XLSX.read(ab, { type: "array", sheets: ["Meta"] });   // older summaries
       const m = /cashflow-sig:(\S+)/.exec((wb.Props && wb.Props.Comments) || "");
-      const meta = wb.Sheets["Meta"];
+      const meta = wb.Sheets && wb.Sheets["Meta"];
       lastSaved = { name: latest, sig: m ? m[1] : meta && meta.B1 ? String(meta.B1.v) : null };
       // carry the hand-entered items of the newest saved summary into this session (matched by week date)
       const ks = /cf-state:(\S+)/.exec((wb.Props && wb.Props.Keywords) || "");
-      if (ks) {
+      if (ks && !sharedFound) {
         try {
           const st = decodeState(ks[1]);
           const a = applyCarryState(st), b = applyCashOutState(st.cashOut, latest), u = applyDisposalState(st.unitDisposals, latest);
-          if ((a || b || u) && report) refresh();
+          if (a) typedBase = emptyTyped();                       // carried amounts are shared on the first Save
+          if (a || b || u) refresh();
         } catch (_) { /* unreadable state: ignore */ }
       }
     }
   } catch (_) { lastSaved = null; }
-  $("last-saved").textContent = lastSaved ? `Last saved: ${lastSaved.name}` : "";
+  $("last-saved").textContent = lastSaved ? (lastSaved.name === LATEST_NAME ? "Latest summary in FILES" : `Last saved: ${lastSaved.name}`) : "";
   $("last-saved").title = lastSaved ? lastSaved.name : "";
   updateSaveState();
 }
@@ -1392,7 +1482,7 @@ const decodeState = (s) => JSON.parse(decodeURIComponent(escape(atob(s))));
 function applyCarryState(st) {
   if (!st || !st.rows || hasEdits() || customRows.length) return false;      // never overwrite what is on screen
   const idMap = {};
-  st.rows.forEach((r) => { const id = nextRowId++; idMap[r.id] = id; customRows.push({ id, name: r.name, sign: r.sign, vals: { ...r.vals } }); });
+  st.rows.forEach((r) => { const id = nextRowId++; idMap[r.id] = id; customRows.push({ id, uid: r.uid || newUid(), name: r.name, sign: r.sign, vals: { ...r.vals } }); });
   const fixed = new Set([...CASH_IN, ...CASH_OUT].map(([k]) => k));
   const map = (k) => (k.startsWith("c:") ? (idMap[k.slice(2)] ? "c:" + idMap[k.slice(2)] : null) : fixed.has(k) ? k : null);
   const ord = (a) => (a || []).map(map).filter(Boolean);
@@ -1477,7 +1567,11 @@ function copySheet(dst, src, name) {
     row.eachCell({ includeEmpty: true }, (cell, cn) => {
       const t = d.getCell(cn);
       if (cell.type !== ExcelJS.ValueType.Merge) t.value = copyValue(cell);
-      if (cell.style) t.style = JSON.parse(JSON.stringify(cell.style));
+      if (cell.style) {
+        t.style = JSON.parse(JSON.stringify(cell.style));
+        const fg = t.style.fill && t.style.fill.fgColor && t.style.fill.fgColor.argb;
+        if (fg === "FFFFF2CC") delete t.style.fill;                    // the system's "edited" yellow is not shown in the summary file
+      }
     });
   });
   Object.values(src._merges || {}).forEach((m) => { try { ws.mergeCells(m.range); } catch (_) {} });
@@ -1667,7 +1761,6 @@ async function buildWorkbookXlsx(sig) {
   const ws = wb.addWorksheet("Summary", { views: [{ state: "frozen", xSplit: 5, ySplit: 10, zoomScale: 75, showGridLines: false }] });
   const det = await addDetailSheets(wb, r);
   // amount cell of a row: a formula into its detail sheet; a typed change is kept as "+ (adjustment)"
-  const ADJ_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
   const amountCell = (k, i, L) => {
     const link = det.links[k], val = c.v[k][i];
     if (!link) return { v: val };
@@ -1727,7 +1820,7 @@ async function buildWorkbookXlsx(sig) {
   const inFirst = row;
   for (const [k, label] of rowOrder.in.map((k) => [k, xlLabel(k)])) {
     put(`B${row}`, label);
-    weekCells(row, (L, i) => { const a = amountCell(k, i, L), x = put(`${L}${row}`, a.v, { fmt: XL_NUM }); if (a.adj) x.fill = ADJ_FILL; });
+    weekCells(row, (L, i) => { put(`${L}${row}`, amountCell(k, i, L).v, { fmt: XL_NUM }); });
     put(`${xlCol(TOT)}${row}`, { formula: totalFormula(row), result: sum(c.v[k]) }, { fmt: XL_NUM, bold: true });
     row++;
   }
@@ -1742,7 +1835,7 @@ async function buildWorkbookXlsx(sig) {
   const outFirst = row;
   for (const [k, label] of rowOrder.out.map((k) => [k, xlLabel(k)])) {
     put(`B${row}`, label);
-    weekCells(row, (L, i) => { const a = amountCell(k, i, L), x = put(`${L}${row}`, a.v, { fmt: XL_NUM }); if (a.adj) x.fill = ADJ_FILL; });
+    weekCells(row, (L, i) => { put(`${L}${row}`, amountCell(k, i, L).v, { fmt: XL_NUM }); });
     put(`${xlCol(TOT)}${row}`, { formula: totalFormula(row), result: sum(c.v[k]) }, { fmt: XL_NUM, bold: true });
     row++;
   }
@@ -1797,6 +1890,12 @@ async function saveUploadedCopies() {
     s.copySaved = true; s.saved = true; s.savedIn = `${UPLOAD_DIR}/${uploadBatch}`;
     done.push(name);
   }
+  if (bankUpload && !bankUpload.copied) {
+    if (!uploadBatch) uploadBatch = batchFolderName();
+    const name = await uniqueName([UPLOAD_DIR, uploadBatch], bankUpload.file.name);
+    await writeTo([UPLOAD_DIR, uploadBatch], name, bankUpload.buffer);
+    bankUpload.copied = true; done.push(name);
+  }
   return done;
 }
 let saving = false;
@@ -1809,147 +1908,373 @@ async function saveSummary() {
   catch (e) { console.error(e); toast("Not saved — something went wrong:<small>" + escapeHtml(e && e.message ? e.message : String(e)) + "</small>", true, 12000); }
   finally { saving = false; $("btn-save").innerHTML = ""; updateSaveState(); }
 }
-async function saveSummaryInner() {
+async function saveSummaryInner(finalize) {
+  // ask first (while the click is fresh) for permission to update original files
+  for (const k of FILE_KINDS.map(([x]) => x).filter((x) => hasOriginal(x) && (editCount(x) || state[x].syncOriginal) && state[x].handle)) {
+    try { const hd = state[k].handle; if ((await hd.queryPermission({ mode: "readwrite" })) !== "granted") await hd.requestPermission({ mode: "readwrite" }); } catch (_) {}
+  }
   if (editing) toggleEdit();
+  clearTimeout(reingestTimer); for (const k of Object.keys(state)) if (state[k].wbEdit && editCount(k)) await reingest(k);   // edits still being recalculated
   saveStep("Checking the save folder…");
   if (HAS_FS && !(await folderReady())) {
-    toast("Choose the save folder (FILES) first — then the summary is saved there.", false, 5000);
+    toast("Choose the shared FILES folder first — then the summary is saved there.", false, 5000);
     await connectFolder();
     if (!(await folderReady())) { toast("Not saved — no save folder connected. Click Connect folder (bottom of the sidebar) and try again.", true, 7000); return; }
   }
-  // ask first (while the click is fresh) for permission to update edited original files
-  for (const k of FILE_KINDS.map(([x]) => x).filter((x) => hasOriginal(x) && editCount(x) && state[x].handle)) {
-    try { const hd = state[k].handle; if ((await hd.queryPermission({ mode: "readwrite" })) !== "granted") await hd.requestPermission({ mode: "readwrite" }); } catch (_) {}
+  if (!(await folderReady())) {                                   // no shared folder: download only
+    const buf = await buildWorkbookXlsx(summarySignature()), name = `Cashflow_Summary_${toISO(new Date())}_${stamp().slice(9)}.xlsx`;
+    downloadBuffer(buf, name);
+    toast(`No folder connected — downloaded instead<small>Connect the shared FILES folder (bottom of the sidebar) so everyone's work is combined.</small>`, false, 7000);
+    return;
   }
-  if (await folderReady()) {
-    saveStep("Checking who is working…");
-    if (!(await ensureLock(false))) { toast("Not saved — someone else is preparing the cashflow.", true, 6000); return; }
-    const newer = await newerSummaryByOthers();
-    if (newer && !confirm(`Someone else saved a newer summary after you opened the system:
-${newer}
-
-Your summary does not include their hand-entered rows/amounts.
-
-OK = save mine anyway (it becomes the newest)
-Cancel = don't save (reload the page to start from their summary)`)) return;
-  }
-  // V3.4: edits made in the uploaded files are written into their originals first (with a backup)
-  let wr;
-  saveStep("Updating edited files…");
-  try { wr = await writeEditedOriginals(); } catch (e) { toast("Could not update the original file(s): " + escapeHtml(e.message), true, 8000); return; }
-  if (!wr.ok) { toast(escapeHtml(wr.msg), true, 8000); return; }
-  renderFileList();
-  if (!$("fe-modal").classList.contains("hidden")) renderEditor();
-  saveStep("Building the summary + detail sheets…");
-  const sig = summarySignature();
-  const buf = await buildWorkbookXlsx(sig);
-  saveStep("Writing to the folder…");
-  let name = `Cashflow_Summary_${toISO(new Date())}_${stamp().slice(9)}.xlsx`;
+  if (!userName() && !askUserName()) { toast("Not saved — type your name first (it is recorded with what you save).", true, 6000); return; }
+  saveStep("Waiting for other saves…");
+  if (!(await acquireSaveLock())) { toast("Not saved — another save is taking too long. Try again in a minute.", true, 8000); return; }
   try {
-    if (await folderReady()) {
-      name = await uniqueName(SUMMARY_DIR, name);
-      await writeTo(SUMMARY_DIR, name, buf);
-      lastSaved = { name, sig };
-      mySaves.add(name);
-      saveStep("Saving copies of the uploaded files…");
-      let copies = [];
-      try { copies = await saveUploadedCopies(); } catch (e) { toast("The summary was saved, but copies of the uploaded files could not be saved:<small>" + escapeHtml(e.message) + "</small>", true, 10000); }
-      await releaseLock();
-      $("last-saved").textContent = `Last saved: ${name}`;
-      $("last-saved").title = name;
-      updateSaveState();
-      const chip = $("last-saved"); chip.classList.add("flash"); setTimeout(() => chip.classList.remove("flash"), 4000);
-      toast(`✓ Summary saved at ${new Date().toLocaleTimeString("en-PH", { hour: "numeric", minute: "2-digit" })}<small>${escapeHtml(baseDir.name)}/${SUMMARY_DIR}/${escapeHtml(name)}${copies.length ? `<br>Uploaded files copied to ${UPLOAD_DIR}/${escapeHtml(uploadBatch)}: ${copies.map(escapeHtml).join(", ")}` : ""}${wr.written.length ? "<br>Updated original file(s): " + wr.written.map(escapeHtml).join("; ") : ""}${wr.skipped && wr.skipped.length ? "<br>Not changed (kept in the system only): " + wr.skipped.map(escapeHtml).join("; ") : ""}</small>`, false, 9000);
-    } else {
-      downloadBuffer(buf, name);
-      toast(`No folder connected — downloaded instead<small>Connect a folder (bottom of the sidebar) to save straight into "${SUMMARY_DIR}".</small>`, false, 7000);
-    }
+    // edits made in the uploaded files are written into their originals first (with a backup)
+    let wr;
+    saveStep("Updating edited files…");
+    try { wr = await writeEditedOriginals(); } catch (e) { toast("Could not update the original file(s): " + escapeHtml(e.message), true, 8000); return; }
+    if (!wr.ok) { toast(escapeHtml(wr.msg), true, 8000); return; }
+    saveStep("Combining with everyone's updates…");
+    const shared = await saveShared();
+    renderFileList();
+    if (!$("fe-modal").classList.contains("hidden")) renderEditor();
+    if (!report) { toast(`✓ Saved<small>${shared.map(escapeHtml).join(", ") || "Nothing changed"}</small>`); return; }
+    saveStep("Building the summary + detail sheets…");
+    const sig = summarySignature();
+    const buf = await buildWorkbookXlsx(sig);
+    saveStep("Writing the summary…");
+    await writeTo(SUMMARY_DIR, LATEST_NAME, buf);
+    let dated = null;
+    if (finalize) { dated = await uniqueName(SUMMARY_DIR, `Cashflow_Summary_${toISO(new Date())}_${stamp().slice(9)}.xlsx`); await writeTo(SUMMARY_DIR, dated, buf); }
+    lastSaved = { name: LATEST_NAME, sig };
+    saveStep("Saving copies of the uploaded files…");
+    let copies = [];
+    try { copies = await saveUploadedCopies(); } catch (e) { toast("Saved, but copies of the uploaded files could not be kept:<small>" + escapeHtml(e.message) + "</small>", true, 10000); }
+    $("last-saved").textContent = `Last saved: ${whenText(new Date().toISOString())}`;
+    $("last-saved").title = `${SUMMARY_DIR}/${LATEST_NAME}`;
+    const chip = $("last-saved"); chip.classList.add("flash"); setTimeout(() => chip.classList.remove("flash"), 4000);
+    toast(`✓ ${finalize ? "Week finalized" : "Saved"} at ${new Date().toLocaleTimeString("en-PH", { hour: "numeric", minute: "2-digit" })}<small>${shared.length ? "Shared: " + shared.map(escapeHtml).join(", ") + "<br>" : ""}Summary with everyone's latest work: ${SUMMARY_DIR}/${LATEST_NAME}${dated ? `<br>Dated copy kept: ${SUMMARY_DIR}/${escapeHtml(dated)}` : ""}${copies.length ? `<br>Uploaded files copied to ${UPLOAD_DIR}/${escapeHtml(uploadBatch)}: ${copies.map(escapeHtml).join(", ")}` : ""}${editedCopies.length ? `<br>Edited file(s) kept in ${UPLOAD_DIR}/${escapeHtml(uploadBatch)}: ${editedCopies.map(escapeHtml).join(", ")}` : ""}${wr.written.length ? "<br>Updated original file(s): " + wr.written.map(escapeHtml).join("; ") : ""}${wr.skipped && wr.skipped.length ? "<br>Not changed (kept in the system only): " + wr.skipped.map(escapeHtml).join("; ") : ""}</small>`, false, 10000);
     saved = true;
-  } catch (e) { toast("Not saved — could not write the summary:<small>" + escapeHtml(e.message) + "</small>", true, 12000); }
+  } finally { await releaseSaveLock(); }
+}
+async function finalizeWeek() {
+  if (!report || saving) return;
+  if (!confirm("Finalize week?\n\nThis saves everything (like Save summary) and also keeps a dated copy of the summary in Cashflow Summary as this week's record.")) return;
+  saving = true; saveStep("Finalizing…");
+  try { await saveSummaryInner(true); }
+  catch (e) { console.error(e); toast("Not saved — something went wrong:<small>" + escapeHtml(e && e.message ? e.message : String(e)) + "</small>", true, 12000); }
+  finally { saving = false; $("btn-save").innerHTML = ""; updateSaveState(); }
 }
 
 /* ============================================================
-   Shared folder (e.g. a mapped network drive Z:\) used by several people
-   - "In use" lock file in FILES: only the person holding it can save; it expires after 15 min without activity
-   - before saving: warn if someone else saved a newer summary since this page was opened
+   Several people, one shared cashflow (LAN folder FILES)
+   FILES/Current/ holds the latest version of every part, each saved separately:
+     part-<ar|cf|ds|ln|uc|po>.json (+ <k>-file.<ext>)  source files with their edits
+     part-bank.json   bank balances (Beginning Balance of Week 1)
+     part-typed.json  typed amounts / added rows, cell by cell, with who typed them
+   Opening the system loads all parts. Save re-reads them, writes only the parts you changed, and rebuilds
+   Cashflow_Summary_LATEST.xlsx from everyone's latest work. "Finalize week" keeps a dated copy.
    ============================================================ */
-const LOCK_FILE = "cashflow_in_use.json", LOCK_STALE_MIN = 15;   // plain name: browsers refuse names starting with "~"
+const CURRENT_DIR = "Current", LATEST_NAME = "Cashflow_Summary_LATEST.xlsx", SAVE_LOCK = "_saving.json";
+var SHARED_KINDS = ["ar", "cf", "ds", "ln", "uc", "po"];
+const PART_LABEL = { ar: "AR Aging", cf: "Cash Flow Report", ds: "Unit Disposals", ln: "Loan Payment Schedule", uc: "Unreleased Checks", po: "Projected Cash Outflow", bank: "Bank balances", typed: "Typed amounts / added rows" };
 const SESSION_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
-// this computer/browser (kept across page reloads): a lock left by an earlier session here is still "mine"
-const DEVICE_ID = (() => { try { let d = localStorage.getItem("cf-device"); if (!d) { d = "pc-" + Math.random().toString(36).slice(2); localStorage.setItem("cf-device", d); } return d; } catch (_) { return SESSION_ID; } })();
-let lockInfo = null;            // last lock read from the folder
-let lockTimer = null;
-let sessionBaseSummary = null;  // newest summary when this page connected (to detect newer saves by others)
-const mySaves = new Set();
+var sharedLoading = false;      // true while parts from FILES/Current are being read (not a change by this user)
+var sharedFound = false;        // FILES/Current had parts when the page connected
+const sharedSeen = {};          // part -> "at" of the version on screen
+var editedCopies = [], bankDirty = false, bankInfo = null, typedBase = null, typedMeta = { ov: {}, rows: {} }, pollTimer = null, pendingNews = [];
+const newUid = () => "r" + Math.random().toString(36).slice(2, 10);
+
 function userName() { try { return localStorage.getItem("cf-user") || ""; } catch (_) { return ""; } }
 function setUserName(n) { try { localStorage.setItem("cf-user", n); } catch (_) {} renderUser(); }
-function renderUser() { const n = userName(); $("user-label").textContent = n || "Set your name"; $("btn-user").title = n ? `Signed in as ${n} — click to change` : "Your name (shown to others while you prepare the cashflow)"; }
+function renderUser() { const n = userName(); $("user-label").textContent = n || "Set your name"; $("btn-user").title = n ? `Signed in as ${n} — your saves are recorded under this name. Click to change.` : "Your name (recorded with every part you save)"; }
 function askUserName() {
-  const n = prompt("Your name (shown to others while you prepare the cashflow):", userName() || "");
+  const n = prompt("Your name (recorded with every part you save, so others see who updated what):", userName() || "");
   if (n && n.trim()) setUserName(n.trim());
   return userName();
 }
-const minsAgo = (iso) => (Date.now() - new Date(iso).getTime()) / 60000;
 const hhmm = (iso) => new Date(iso).toLocaleTimeString("en-PH", { hour: "numeric", minute: "2-digit" });
-async function readLock() {
-  if (!baseDir) return null;
-  try { const fh = await baseDir.getFileHandle(LOCK_FILE); return JSON.parse(await (await fh.getFile()).text()); } catch (_) { return null; }
+function whenText(iso) {
+  if (!iso) return "";
+  const d = new Date(iso), today = new Date();
+  return d.toDateString() === today.toDateString() ? `today ${hhmm(iso)}` : `${d.toLocaleDateString("en-PH", { month: "short", day: "numeric" })} ${hhmm(iso)}`;
 }
-const lockIsMine = (l) => !!l && (l.session === SESSION_ID || (!!l.device && l.device === DEVICE_ID));
-const lockIsLive = (l) => !!l && minsAgo(l.heartbeat || l.since) < LOCK_STALE_MIN;
-async function writeLock(since) {
-  const l = { user: userName() || "Someone", session: SESSION_ID, device: DEVICE_ID, since: since || new Date().toISOString(), heartbeat: new Date().toISOString() };
-  await writeTo([], LOCK_FILE, new Blob([JSON.stringify(l)], { type: "application/json" }));
-  lockInfo = l;
-  return l;
+function typedTip(k, iso) {
+  const m = k.startsWith("c:") ? (typedMeta.rows[(customRows.find((r) => "c:" + r.id === k) || {}).uid] || {})[iso] : (typedMeta.ov[k] || {})[iso];
+  const base = typedBase && (k.startsWith("c:") ? null : typedBase.overrides[k]);
+  const cur = k.startsWith("c:") ? null : overrides[k] && overrides[k][iso];
+  if (!m || (base && cur !== base[iso])) return "Typed by you — not saved yet";
+  return `Typed by ${m.by} (${whenText(m.at)})`;
 }
-// take the "in use" lock (when starting to work); returns false if someone else is working right now
-async function ensureLock(quiet) {
-  if (!(await folderReady())) return true;                       // no shared folder: nothing to protect
-  const l = await readLock();
-  if (lockIsMine(l)) { lockInfo = l; return true; }
-  if (lockIsLive(l)) {
-    lockInfo = l; renderLock();
-    if (quiet) return false;
-    if (!confirm(`${l.user} is preparing the cashflow right now (since ${hhmm(l.since)}, last active ${hhmm(l.heartbeat)}).\n\nOK = take over (their unsaved work cannot be saved anymore)\nCancel = only view`)) return false;
+function renderBankInfo() {
+  const el = $("bank-by");
+  if (!el) return;
+  el.textContent = bankDirty ? `Changed by you${bankUpload && !bankUpload.copied ? ` (from ${bankUpload.file.name})` : ""} — not saved yet (Save summary shares it with everyone).`
+    : bankInfo ? `Shared balances — updated by ${bankInfo.by}, ${whenText(bankInfo.at)}${bankInfo.source ? ` (from ${bankInfo.source})` : ""}.` : "";
+}
+
+// ---- reading / writing FILES/Current
+async function curDir() { return openDir(CURRENT_DIR); }
+async function readJson(dir, name) { try { return JSON.parse(await (await (await dir.getFileHandle(name)).getFile()).text()); } catch (_) { return null; } }
+async function writeJson(name, obj) { await writeTo(CURRENT_DIR, name, new Blob([JSON.stringify(obj)], { type: "application/json" })); }
+const stamp2 = () => ({ by: userName() || "Someone", at: new Date().toISOString(), session: SESSION_ID });
+
+// ---- typed amounts / added rows: compare with what was loaded, merge into the latest shared version
+function typedNow() {
+  customRows.forEach((r) => { if (!r.uid) r.uid = newUid(); });
+  const uidOf = (k) => (k.startsWith("c:") ? "c:" + (customRows.find((r) => "c:" + r.id === k) || {}).uid : k);
+  return {
+    overrides: Object.fromEntries(Object.entries(overrides).map(([k, m]) => [k, { ...m }])),
+    rows: customRows.map((r) => ({ uid: r.uid, name: r.name, sign: r.sign, vals: { ...r.vals } })),
+    order: { in: rowOrder.in.map(uidOf), out: rowOrder.out.map(uidOf) },
+  };
+}
+const emptyTyped = () => ({ overrides: {}, rows: [], order: null });
+function typedChanges(now, base) {
+  const ch = [];
+  const keys = new Set([...Object.keys(now.overrides), ...Object.keys(base.overrides)]);
+  for (const k of keys) {
+    const a = now.overrides[k] || {}, b = base.overrides[k] || {};
+    for (const d of new Set([...Object.keys(a), ...Object.keys(b)])) if (a[d] !== b[d]) ch.push(a[d] === undefined ? { t: "ovDel", k, d } : { t: "ov", k, d, v: a[d] });
   }
-  if (!userName()) askUserName();
-  await writeLock();
-  clearInterval(lockTimer);
-  lockTimer = setInterval(async () => { const cur = await readLock(); if (lockIsMine(cur)) await writeLock(cur.since); else { clearInterval(lockTimer); lockInfo = cur; renderLock(); } }, 2 * 60000);
-  renderLock();
-  return true;
+  const bRows = new Map(base.rows.map((r) => [r.uid, r])), nRows = new Map(now.rows.map((r) => [r.uid, r]));
+  for (const r of now.rows) {
+    const o = bRows.get(r.uid);
+    if (!o) { ch.push({ t: "rowAdd", row: r }); continue; }
+    if (o.name !== r.name || o.sign !== r.sign) ch.push({ t: "rowSet", uid: r.uid, name: r.name, sign: r.sign });
+    for (const d of new Set([...Object.keys(r.vals), ...Object.keys(o.vals)])) if (r.vals[d] !== o.vals[d]) ch.push({ t: "cell", uid: r.uid, d, v: r.vals[d] });
+  }
+  for (const r of base.rows) if (!nRows.has(r.uid)) ch.push({ t: "rowDel", uid: r.uid });
+  if (JSON.stringify(now.order) !== JSON.stringify(base.order)) ch.push({ t: "order", order: now.order });
+  return ch;
 }
-async function releaseLock() {
-  clearInterval(lockTimer);
-  try { const l = await readLock(); if (lockIsMine(l)) await baseDir.removeEntry(LOCK_FILE); } catch (_) {}
-  lockInfo = null; renderLock();
+function applyTypedChanges(remote, ch, who) {
+  const R = remote ? JSON.parse(JSON.stringify(remote)) : { overrides: {}, rows: [], order: null };
+  R.overrides = R.overrides || {}; R.rows = R.rows || [];
+  const cellV = (x) => (x && typeof x === "object" ? x : { v: x });
+  for (const c of ch) {
+    if (c.t === "ov") { R.overrides[c.k] = R.overrides[c.k] || {}; R.overrides[c.k][c.d] = { v: c.v, by: who.by, at: who.at }; }
+    else if (c.t === "ovDel") { if (R.overrides[c.k]) delete R.overrides[c.k][c.d]; }
+    else if (c.t === "rowAdd") { if (!R.rows.some((r) => r.uid === c.row.uid)) R.rows.push({ uid: c.row.uid, name: c.row.name, sign: c.row.sign, by: who.by, at: who.at, vals: Object.fromEntries(Object.entries(c.row.vals).map(([d, v]) => [d, { v, by: who.by, at: who.at }])) }); }
+    else if (c.t === "rowDel") { R.rows = R.rows.filter((r) => r.uid !== c.uid); }
+    else if (c.t === "rowSet") { const r = R.rows.find((x) => x.uid === c.uid); if (r) Object.assign(r, { name: c.name, sign: c.sign }); }
+    else if (c.t === "cell") { const r = R.rows.find((x) => x.uid === c.uid); if (r) { if (c.v === undefined) delete r.vals[c.d]; else r.vals[c.d] = { v: c.v, by: who.by, at: who.at }; } }
+    else if (c.t === "order") R.order = c.order;
+  }
+  R.rows.forEach((r) => Object.keys(r.vals).forEach((d) => (r.vals[d] = cellV(r.vals[d]))));
+  Object.values(R.overrides).forEach((m) => Object.keys(m).forEach((d) => (m[d] = cellV(m[d]))));
+  return R;
 }
-async function refreshLock() { lockInfo = await readLock(); renderLock(); }
-function lockedByOther() { return lockInfo && !lockIsMine(lockInfo) && lockIsLive(lockInfo); }
-function renderLock() {
+// put a shared typed version on screen (and remember it as the base for the next comparison)
+function adoptTyped(R) {
+  R = R || { overrides: {}, rows: [], order: null };
+  overrides = {}; typedMeta = { ov: {}, rows: {} };
+  for (const [k, m] of Object.entries(R.overrides || {})) for (const [d, x] of Object.entries(m)) {
+    (overrides[k] = overrides[k] || {})[d] = x.v; (typedMeta.ov[k] = typedMeta.ov[k] || {})[d] = { by: x.by, at: x.at };
+  }
+  customRows = (R.rows || []).map((r) => {
+    typedMeta.rows[r.uid] = Object.fromEntries(Object.entries(r.vals || {}).map(([d, x]) => [d, { by: x.by, at: x.at }]));
+    return { id: nextRowId++, uid: r.uid, name: r.name, sign: r.sign, vals: Object.fromEntries(Object.entries(r.vals || {}).map(([d, x]) => [d, x.v])) };
+  });
+  const fixed = new Set([...CASH_IN, ...CASH_OUT].map(([k]) => k)), byUid = new Map(customRows.map((r) => [r.uid, "c:" + r.id]));
+  const map = (k) => (k.startsWith("c:") ? byUid.get(k.slice(2)) || null : fixed.has(k) ? k : null);
+  const ord = { in: ((R.order && R.order.in) || []).map(map).filter(Boolean), out: ((R.order && R.order.out) || []).map(map).filter(Boolean) };
+  CASH_IN.forEach(([k]) => { if (!ord.in.includes(k) && !ord.out.includes(k)) ord.in.push(k); });
+  CASH_OUT.forEach(([k]) => { if (!ord.in.includes(k) && !ord.out.includes(k)) ord.out.push(k); });
+  customRows.forEach((r) => { const k = "c:" + r.id; if (!ord.in.includes(k) && !ord.out.includes(k)) ord.in.push(k); });
+  rowOrder.in = ord.in; rowOrder.out = ord.out;
+  typedBase = typedNow();
+}
+
+// ---- one source part
+const INGEST = { ar: (f) => handleFile("ar", f), cf: (f) => handleCashflowReport(f), ds: (f) => handleDisposal(f), ln: (f) => handleCashOut("ln", f), uc: (f) => handleCashOut("uc", f), po: (f) => handleCashOut("po", f) };
+function clearPart(k) {
+  const s = state[k];
+  if (k === "ds") Object.assign(s, { rows: [], file: null, buffer: null, from: "" });
+  else if (CO_META[k]) Object.assign(s, { byDate: {}, file: null, buffer: null, info: "", from: "", rows: [] });
+  else Object.assign(s, { rows: [], file: null, buffer: null });
+  resetFileEdits(k);
+  const d = $("drop-" + k); if (d) d.classList.remove("loaded");
+}
+async function loadPart(dir, k, p) {
+  const s = state[k];
+  clearPart(k);
+  if (!p.empty) {
+    if (p.file) {
+      const f = await (await dir.getFileHandle(p.file)).getFile();
+      sharedLoading = true;
+      try { await INGEST[k](new File([await f.arrayBuffer()], p.fileName || p.file, { type: f.type })); } finally { sharedLoading = false; }
+      if (k === "ar" && p.map) s.map = p.map;
+      await reattachOriginal(k, p.fileName || "");
+    } else if (p.data && k === "ds") applyDisposalState(p.data, p.from || "shared");
+    else if (p.data && CO_META[k]) applyCashOutState({ [k]: p.data }, p.from || "shared");
+  }
+  Object.assign(s, { dirty: false, removed: false, sharedBy: p.by, sharedAt: p.at, copySaved: true });
+  sharedSeen[k] = p.at;
+  if (k === "ds") renderDisposalMonths();
+  if (CO_META[k]) renderCashOutSources();
+}
+async function writePart(k) {
+  const s = state[k], who = stamp2(), p = { kind: k, ...who };
+  if (s.removed || !hasFileData(k)) p.empty = true;
+  else if (s.buffer) {
+    let buf = s.buffer;
+    if (editCount(k) && /\.(xlsx|xlsm)$/i.test(s.file ? s.file.name : "")) {      // put the edits into the shared copy
+      s.editedSave = true;
+      const wb = await excelOf(k);
+      wb.calcProperties = Object.assign(wb.calcProperties || {}, { fullCalcOnLoad: true });
+      const out = await wb.xlsx.writeBuffer();
+      buf = out instanceof ArrayBuffer ? out : out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+      for (const [sheet, cells] of Object.entries(s.edits || {})) { s.written[sheet] = s.written[sheet] || {}; Object.keys(cells).forEach((a) => (s.written[sheet][a] = true)); }
+      Object.assign(s, { buffer: buf, edits: {}, recalc: {}, ops: [] });
+    }
+    const name = s.file ? s.file.name : k + ".xlsx", ext = (/\.[^.]+$/.exec(name) || [".xlsx"])[0];
+    p.file = `${k}-file${ext}`; p.fileName = name;
+    await writeTo(CURRENT_DIR, p.file, buf);
+    if (k === "ar") p.map = s.map;
+  } else if (k === "ds") {
+    p.data = { name: s.savedFrom || "", sheet: s.sheet || "", rows: s.rows.map((x) => ({ from: toISO(x.from), to: toISO(x.to), amount: x.amount, units: x.units, monday: toISO(x.monday) })) };
+  } else if (CO_META[k]) p.data = { byDate: s.byDate, info: s.info, name: s.savedFrom || "" };
+  await writeJson(`part-${k}.json`, p);
+  Object.assign(s, { dirty: false, removed: false, sharedBy: p.by, sharedAt: p.at, remEdited: {} });
+  sharedSeen[k] = p.at;
+}
+
+// ---- load everything others saved (parts I have changed but not saved are kept, unless force)
+async function loadShared(opts = {}) {
+  if (!baseDir) return false;
+  const dir = await curDir();
+  let found = false;
+  for (const k of SHARED_KINDS) {
+    const p = await readJson(dir, `part-${k}.json`);
+    if (!p) continue;
+    found = true;
+    if (p.at === sharedSeen[k] || (state[k].dirty && !opts.force)) continue;
+    showProgress(`Loading ${PART_LABEL[k]}${p.by ? ` (saved by ${p.by}, ${whenText(p.at)})` : ""}…`);
+    try { await loadPart(dir, k, p); } catch (e) { toast(`Could not load the shared ${PART_LABEL[k]}:<small>${escapeHtml(e.message)}</small>`, true, 8000); }
+  }
+  const bank = await readJson(dir, "part-bank.json");
+  if (bank) {
+    found = true;
+    if (bank.at !== sharedSeen.bank && (!bankDirty || opts.force)) {
+      accounts.splice(0, accounts.length, ...bank.accounts.map((a) => ({ bank: a.bank || "", no: a.no || "", purpose: a.purpose || "", bal: +a.bal || 0 })));
+      bankInfo = bank; bankDirty = false; sharedSeen.bank = bank.at;
+      try { localStorage.setItem(ACCT_KEY, JSON.stringify(accounts)); } catch (_) {}
+      renderAccounts();
+    }
+  }
+  const typed = await readJson(dir, "part-typed.json");
+  if (typed) {
+    found = true;
+    if (typed.at !== sharedSeen.typed) {
+      const mine = typedBase ? typedChanges(typedNow(), typedBase) : [];
+      adoptTyped(typed); sharedSeen.typed = typed.at;
+      if (mine.length && !opts.force) { const R = applyTypedChanges(typed, mine, stamp2()); const keepBase = typedBase; adoptTyped(R); typedBase = keepBase; }   // keep my unsaved typing on top
+    }
+  }
+  if (typedBase === null) typedBase = typedNow();
+  renderBankInfo(); renderFileList(); renderAccounts();
+  if (found) refresh();
+  pendingNews = []; renderNews();
+  return found;
+}
+// progress / status line at the top of the page
+function showProgress(text) {
   const b = $("lock-banner");
-  if (lockedByOther()) {
-    b.className = "lock-banner other";
-    b.innerHTML = `🔒 <b>${escapeHtml(lockInfo.user)}</b> is preparing the cashflow (since ${hhmm(lockInfo.since)}, last active ${hhmm(lockInfo.heartbeat)}). You can look around, but <b>saving is disabled</b> so nothing gets overwritten.
-      <button type="button" class="btn small" id="lock-take">Take over</button><button type="button" class="btn small ghost" id="lock-check">Check again</button>`;
-    $("lock-take").onclick = async () => { if (await ensureLock(false)) toast("You are now preparing the cashflow."); updateSaveState(); };
-    $("lock-check").onclick = async () => { await refreshLock(); updateSaveState(); };
-  } else if (lockInfo && lockIsMine(lockInfo)) {
-    b.className = "lock-banner mine";
-    b.innerHTML = `✏️ You (<b>${escapeHtml(lockInfo.user)}</b>) are preparing the cashflow — others see it as <b>in use</b> until you save (or after ${LOCK_STALE_MIN} min without activity).`;
-  } else b.className = "lock-banner hidden";
-  updateSaveState();
+  b.className = "lock-banner mine";
+  b.innerHTML = `<span class="spin"></span> ${escapeHtml(text)}`;
 }
-// someone else saved a newer summary after this page connected?
-async function newerSummaryByOthers() {
+function showNothingShared() {
+  const b = $("lock-banner");
+  b.className = "lock-banner mine";
+  b.innerHTML = `ℹ️ <b>Nothing has been shared yet</b> in ${escapeHtml(baseDir.name)}/${CURRENT_DIR}. Upload the files once and click <b>Save summary</b> — after that, everyone who opens the system sees the latest work automatically.${report ? " Showing what was kept in the last saved summary for now." : ""}
+    <button type="button" class="btn small" id="ns-upload">Upload files</button>`;
+  $("ns-upload").onclick = () => { b.className = "lock-banner hidden"; openUpload(); };
+}
+
+// ---- who changed what since this page loaded it (checked every minute)
+async function checkNews() {
+  if (!baseDir || saving) return;
   try {
-    const dir = await baseDir.getDirectoryHandle(SUMMARY_DIR, { create: true }), names = [];
-    for await (const [n, hd] of dir.entries()) if (hd.kind === "file" && /^Cashflow_Summary_.*\.xlsx$/i.test(n)) names.push(n);
-    names.sort();
-    const newest = names[names.length - 1];
-    return newest && newest !== sessionBaseSummary && !mySaves.has(newest) ? newest : null;
-  } catch (_) { return null; }
+    const dir = await curDir(), news = [];
+    for (const k of [...SHARED_KINDS, "bank", "typed"]) {
+      const p = await readJson(dir, `part-${k}.json`);
+      if (p && p.at !== sharedSeen[k] && p.session !== SESSION_ID) news.push({ k, by: p.by, at: p.at });
+    }
+    pendingNews = news; renderNews();
+  } catch (_) {}
+}
+function renderNews() {
+  const b = $("lock-banner");
+  if (!pendingNews.length) { b.className = "lock-banner hidden"; return; }
+  const who = [...new Set(pendingNews.map((x) => x.by))].join(", "), what = pendingNews.map((x) => `${PART_LABEL[x.k]} (${hhmm(x.at)})`).join(", ");
+  b.className = "lock-banner other";
+  b.innerHTML = `🔄 New updates from <b>${escapeHtml(who)}</b>: ${escapeHtml(what)}. <button type="button" class="btn small" id="news-load">Load them</button>`;
+  $("news-load").onclick = async () => { await loadShared(); toast("Loaded the latest updates" + (SHARED_KINDS.some((k) => state[k].dirty) || bankDirty ? "<small>Parts you changed and have not saved yet were kept as yours.</small>" : "")); };
+}
+
+// ---- short lock while a save is being written (a few seconds), so two saves never mix
+async function acquireSaveLock() {
+  const dir = await curDir();
+  for (let n = 0; n < 30; n++) {
+    const l = await readJson(dir, SAVE_LOCK);
+    if (!l || l.session === SESSION_ID || Date.now() - new Date(l.at).getTime() > 60000) {
+      await writeJson(SAVE_LOCK, stamp2());
+      const chk = await readJson(dir, SAVE_LOCK);
+      if (chk && chk.session === SESSION_ID) return true;
+    }
+    saveStep(`Waiting for ${l ? l.by : "another save"} to finish saving…`);
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return false;
+}
+async function releaseSaveLock() { try { const dir = await curDir(), l = await readJson(dir, SAVE_LOCK); if (l && l.session === SESSION_ID) await dir.removeEntry(SAVE_LOCK); } catch (_) {} }
+
+// ---- Save: my changed parts + everyone's latest -> Current + Cashflow_Summary_LATEST.xlsx
+async function saveShared() {
+  const dir = await curDir();
+  // someone saved the same part after I loaded it?
+  for (const k of [...SHARED_KINDS, "bank"]) {
+    const mineChanged = k === "bank" ? bankDirty : state[k].dirty;
+    if (!mineChanged) continue;
+    const p = await readJson(dir, `part-${k}.json`);
+    if (p && p.at !== sharedSeen[k] && p.session !== SESSION_ID && !confirm(`${p.by} also saved "${PART_LABEL[k]}" (${whenText(p.at)}) after you opened it.\n\nOK = save yours (replaces theirs)\nCancel = keep theirs (your changes to this part are dropped)`)) {
+      if (k === "bank") bankDirty = false; else state[k].dirty = false;
+      sharedSeen[k] = null;                                     // load theirs below
+    }
+  }
+  await loadShared();                                           // everyone else's latest (my changed parts are kept)
+  const done = []; editedCopies = [];
+  // a part nobody has shared yet (first use of V3.6, e.g. schedules carried from the last summary) is shared as it is
+  for (const k of SHARED_KINDS) if (!state[k].dirty && hasFileData(k) && !(await readJson(dir, `part-${k}.json`))) state[k].dirty = true;
+  for (const k of SHARED_KINDS) if (state[k].dirty) {
+    saveStep(`Sharing ${PART_LABEL[k]}…`); await writePart(k); done.push(PART_LABEL[k]);
+    if (state[k].editedSave && state[k].buffer) {                // also keep the edited file in Uploaded Files (history)
+      try {
+        const s = state[k], nm = s.file ? s.file.name : k + ".xlsx", dot = nm.lastIndexOf(".");
+        if (!uploadBatch) uploadBatch = batchFolderName();
+        const cp = await uniqueName([UPLOAD_DIR, uploadBatch], `${nm.slice(0, dot)} (edited by ${userName() || "someone"})${nm.slice(dot)}`);
+        await writeTo([UPLOAD_DIR, uploadBatch], cp, s.buffer);
+        editedCopies.push(cp);
+      } catch (e) { toast(`Saved, but the edited copy of ${escapeHtml(PART_LABEL[k])} could not be kept in ${UPLOAD_DIR}:<small>${escapeHtml(e.message)}</small>`, true, 8000); }
+      state[k].editedSave = false;
+    }
+  }
+  if (bankDirty || (acctTotal() !== 0 && !(await readJson(dir, "part-bank.json")))) {   // blank balances (e.g. the website copy) are never shared unless typed
+    const p = { accounts: accounts.map((a) => ({ bank: a.bank, no: a.no, purpose: a.purpose, bal: a.bal })), source: bankUpload ? bankUpload.file.name : "", ...stamp2() };
+    await writeJson("part-bank.json", p); bankInfo = p; bankDirty = false; sharedSeen.bank = p.at;
+    done.push(PART_LABEL.bank);
+  }
+  const ch = typedChanges(typedNow(), typedBase || emptyTyped());
+  if (ch.length) {
+    const remote = await readJson(dir, "part-typed.json"), R = Object.assign(applyTypedChanges(remote, ch, stamp2()), stamp2());
+    await writeJson("part-typed.json", R); adoptTyped(R); sharedSeen.typed = R.at;
+    done.push(PART_LABEL.typed);
+  }
+  renderBankInfo(); renderFileList();
+  return done;
 }
 
 /* ============================================================
@@ -1972,7 +2297,7 @@ $("btn-folder").onclick = connectFolder;
 $("btn-edit").onclick = toggleEdit;
 $("pd-search").oninput = renderPastDue;
 $("btn-add-row").onclick = () => {
-  const nr = { id: nextRowId++, name: "", sign: -1, vals: {} };
+  const nr = { id: nextRowId++, uid: newUid(), name: "", sign: -1, vals: {} };
   customRows.push(nr);
   rowOrder.in.push("c:" + nr.id);
   saved = false;
@@ -2011,6 +2336,11 @@ restoreFolder();
   {
     const dropDs = $("drop-ds");
     $("file-ds").onchange = (e) => e.target.files[0] && handleDisposal(e.target.files[0]);
+    $("file-bk").onchange = (e) => { if (e.target.files[0]) handleBankFile(e.target.files[0]); e.target.value = ""; };
+    const dropBk = $("drop-bk");
+    ["dragenter", "dragover"].forEach((ev) => dropBk.addEventListener(ev, (e) => { e.preventDefault(); dropBk.classList.add("over"); }));
+    ["dragleave", "drop"].forEach((ev) => dropBk.addEventListener(ev, (e) => { e.preventDefault(); dropBk.classList.remove("over"); }));
+    dropBk.addEventListener("drop", (e) => e.dataTransfer.files[0] && handleBankFile(e.dataTransfer.files[0]));
     ["dragenter", "dragover"].forEach((ev) => dropDs.addEventListener(ev, (e) => { e.preventDefault(); dropDs.classList.add("over"); }));
     ["dragleave", "drop"].forEach((ev) => dropDs.addEventListener(ev, (e) => { e.preventDefault(); dropDs.classList.remove("over"); }));
     dropDs.addEventListener("drop", (e) => e.dataTransfer.files[0] && handleDisposal(e.dataTransfer.files[0]));
@@ -2032,7 +2362,7 @@ const FILE_KINDS = [
   ["ln", "Loan Payment Schedule"], ["uc", "Unreleased Checks"], ["po", "Projected Cash Outflow"],
 ];
 const KIND_NAME = Object.fromEntries(FILE_KINDS);
-const startWork = () => { ensureLock(true).catch(() => {}); };
+const startWork = () => {};      // V3.6: no "in use" lock — everyone can work at the same time
 const DISPATCH = {
   ar: (f) => (startWork(), handleFile("ar", f)), ap: (f) => (startWork(), handleFile("ap", f)), cf: (f) => (startWork(), handleCashflowReport(f)), ds: (f) => (startWork(), handleDisposal(f)),
   ln: (f) => (startWork(), handleCashOut("ln", f)), uc: (f) => (startWork(), handleCashOut("uc", f)), po: (f) => (startWork(), handleCashOut("po", f)),
@@ -2052,10 +2382,15 @@ function renderFileList() {
   const ks = FILE_KINDS.filter(([k]) => hasFileData(k));
   $("side-files").classList.toggle("hidden", !ks.length);
   $("file-list").innerHTML = ks.map(([k, label]) => {
-    const n = editCount(k), rem = isRemembered(k);
-    return `<button type="button" class="file-item" data-k="${k}" title="${rem ? "Remembered from the last saved summary — click to adjust" : escapeHtml((state[k].file ? state[k].file.name : "") + " — click to view and edit")}">
-      <span class="fi-name">${label}</span><span class="fi-sub">${rem ? "from saved summary" : escapeHtml(state[k].file ? state[k].file.name : "")}</span>
-      ${n ? `<span class="fi-badge">${n} edit${n > 1 ? "s" : ""}</span>` : ""}</button>`;
+    const n = editCount(k), rem = isRemembered(k), s = state[k];
+    const fname = rem ? "Kept in the last saved summary" : s.file ? s.file.name : "";
+    const by = s.dirty ? "Changed by you · not saved yet" : s.sharedBy ? `Saved by ${s.sharedBy} · ${whenText(s.sharedAt)}` : "Not shared yet — Save summary shares it";
+    const where = (s.handle ? `Original on this computer: ${s.handle.name} (updated on Save)\n` : "Original not linked on this computer\n") + (s.sharedBy && !s.dirty ? `Shared copy: ${baseDir ? baseDir.name : "FILES"}/${CURRENT_DIR}/${k}-file${(/\.[^.]+$/.exec(s.file ? s.file.name : "") || [".xlsx"])[0]}` : "");
+    const tip = [KIND_NAME[k] + (fname ? ": " + fname : ""), by, where, "Click to view and edit"].filter(Boolean).join("\n");
+    return `<button type="button" class="file-item${s.dirty ? " fi-dirty" : ""}" data-k="${k}" title="${escapeHtml(tip)}">
+      <span class="fi-name">${label}</span>${n ? `<span class="fi-badge">${n} edit${n > 1 ? "s" : ""}</span>` : ""}
+      <span class="fi-sub">${escapeHtml(fname)}</span>
+      <span class="fi-by">${escapeHtml(by)}</span></button>`;
   }).join("");
   $("file-list").querySelectorAll(".file-item").forEach((b) => (b.onclick = () => openEditor(b.dataset.k)));
 }
@@ -2074,7 +2409,8 @@ function wirePickers() {
         let hnd;
         try { [hnd] = await window.showOpenFilePicker({ types: XL_TYPES, excludeAcceptAllOption: false, multiple: false }); } catch (_) { return; }
         const file = await hnd.getFile();
-        resetFileEdits(k); state[k].handle = hnd;
+        resetFileEdits(k); state[k].handle = hnd; state[k].origSeen = file.lastModified;
+        rememberOriginal(k, hnd, file.lastModified);
         DISPATCH[k](file);
       });
     }
@@ -2082,9 +2418,37 @@ function wirePickers() {
     drop.addEventListener("drop", (e) => {
       resetFileEdits(k); state[k].handle = null; startWork();
       const it = e.dataTransfer && e.dataTransfer.items && e.dataTransfer.items[0];
-      if (it && it.getAsFileSystemHandle) it.getAsFileSystemHandle().then((hnd) => { if (hnd && hnd.kind === "file") state[k].handle = hnd; }).catch(() => {});
+      if (it && it.getAsFileSystemHandle) it.getAsFileSystemHandle().then(async (hnd) => { if (hnd && hnd.kind === "file") { const f = await hnd.getFile(); state[k].handle = hnd; state[k].origSeen = f.lastModified; rememberOriginal(k, hnd, f.lastModified); } }).catch(() => {});
     }, true);
   }
+}
+
+// ---- the ORIGINAL file of each part, remembered on this computer (so later saves can update it, also after reopening)
+const origKey = (k) => "orig-" + k;
+async function rememberOriginal(k, hnd, lastModified) {
+  try { await idbSet(origKey(k), { handle: hnd, name: hnd.name, lastModified: lastModified || 0 }); } catch (_) {}
+}
+// after a part is loaded from FILES/Current: reconnect it to the original this computer uploaded / linked (same file name)
+async function reattachOriginal(k, fileName) {
+  try {
+    const o = await idbGet(origKey(k));
+    if (o && o.handle && o.name === fileName) { state[k].handle = o.handle; state[k].origSeen = o.lastModified || 0; }
+  } catch (_) {}
+}
+async function linkOriginal(k) {
+  if (!window.showOpenFilePicker) { toast("Linking an original file needs Chrome or Edge.", true, 6000); return; }
+  let hnd;
+  try { [hnd] = await window.showOpenFilePicker({ types: XL_TYPES, excludeAcceptAllOption: false, multiple: false }); } catch (_) { return; }
+  const s = state[k], cur = s.file ? s.file.name : "";
+  if (cur && hnd.name !== cur && !confirm(`Link "${hnd.name}" as the original of ${KIND_NAME[k]}?
+
+The system's file is named "${cur}". On the next Save summary, "${hnd.name}" is replaced with the system's version (a backup is kept first).`)) return;
+  const f = await hnd.getFile();
+  s.handle = hnd; s.origSeen = f.lastModified; s.syncOriginal = true;      // next Save writes the current version into it
+  await rememberOriginal(k, hnd, f.lastModified);
+  if (fe.k === k) openEditorSub(k);
+  renderFileList(); updateSaveState();
+  toast(`Linked: ${escapeHtml(hnd.name)}<small>Click Save summary to update it with the system's version (a backup is kept first). Later saves keep it up to date.</small>`, false, 8000);
 }
 
 // ---- editor state
@@ -2106,13 +2470,21 @@ function sheetGrid(ws) {
   return { rows, r0: rg.s.r, c0: rg.s.c, cols: rg.e.c - rg.s.c + 1 };
 }
 
+function openEditorSub(k) {
+  const rem = isRemembered(k), s = state[k];
+  $("fe-sub").textContent = rem
+    ? "Kept in the last saved summary (no file). Upload the file to edit all its sheets."
+    : `${s.file ? s.file.name : ""} · ${s.handle ? `Save summary updates the shared copy AND the original file "${s.handle.name}" on this computer (a backup is kept first)` : "Save summary updates the shared copy. This computer is not linked to the original file — click Link original file to update it too"}`;
+  const b = $("fe-link");
+  b.classList.toggle("hidden", rem || !window.showOpenFilePicker);
+  b.textContent = s.handle ? "Change original file…" : "Link original file…";
+  b.onclick = () => linkOriginal(k);
+}
 function openEditor(k) {
   fe.k = k; fe.page = 0; fe.q = ""; fe.filters = {}; fe.sel = null; $("fe-search").value = ""; $("fe-pop").classList.add("hidden");
   const rem = isRemembered(k);
   $("fe-title").textContent = KIND_NAME[k];
-  $("fe-sub").textContent = rem
-    ? "Remembered from the last saved summary (no original file this session). Edits are kept in the saved summary only."
-    : `${state[k].file ? state[k].file.name : ""} · ${state[k].handle ? "edits are written into this original file (a backup is kept first) when you click Save summary" : "picked without file access — edits update the Summary but cannot be written back (re-pick the file with Choose file to allow it)"}`;
+  openEditorSub(k);
   if (rem) { fe.sheet = null; $("fe-tabs").innerHTML = ""; }
   else {
     const wb = editWorkbook(k);
@@ -2493,6 +2865,7 @@ function openFilter(col, btn) {
 
 let reingestTimer = null;
 function afterFileEdit(k) {
+  state[k].dirty = true;
   renderFeTabs(); renderEditor(); renderFileList();
   saved = false;
   clearTimeout(reingestTimer);
@@ -2508,7 +2881,7 @@ function afterFileEdit(k) {
 // formula keeps its last value (Excel recalculates it when the file is opened).
 const XL_EPOCH = Date.UTC(1899, 11, 30);
 const serialOf = (d) => (Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours(), d.getMinutes(), d.getSeconds()) - XL_EPOCH) / DAY;
-function evalSimpleFormula(f, ws, wb) {
+function evalSimpleFormula(f, ws, wb, cache) {
   const src = String(f);
   let i = 0;
   const sp = () => { while (src[i] === " ") i++; };
@@ -2530,7 +2903,15 @@ function evalSimpleFormula(f, ws, wb) {
     }
     return { sh, range: XLSX.utils.decode_range(p + ":" + q) };
   }
-  const cells = (r) => { const out = []; for (let R = r.range.s.r; R <= r.range.e.r; R++) for (let C = r.range.s.c; C <= r.range.e.c; C++) out.push(cellV(r.sh, XLSX.utils.encode_cell({ r: R, c: C }))); return out; };
+  const cells = (r) => {
+    let m = null, key = "";
+    if (cache) { m = cache.get(r.sh); if (!m) cache.set(r.sh, (m = new Map())); key = r.range.s.r + ":" + r.range.s.c + ":" + r.range.e.r + ":" + r.range.e.c; const hit = m.get(key); if (hit) return hit; }
+    const out = [], cols = [];
+    for (let C = r.range.s.c; C <= r.range.e.c; C++) cols.push(XLSX.utils.encode_col(C));
+    for (let R = r.range.s.r; R <= r.range.e.r; R++) { const rn = R + 1; for (const cl of cols) { const x = r.sh[cl + rn]; out.push(!x || x.v == null ? null : x.v); } }
+    if (m) m.set(key, out);
+    return out;
+  };
   const args = () => {                                           // after "NAME(": list of refs / values
     const out = [];
     for (;;) {
@@ -2673,31 +3054,93 @@ function recalcUnitPlan(wb, edits, onPut) {
     if (ru >= 0) put(wkN, wk, XLSX.utils.encode_cell({ r: w0.r + ru, c: w0.c + c }), inWk.length);
   }
 }
-function recalcEdited(k) {
+// Cells each formula reads: [{ sheet, r1, c1, r2, c2 }] (0-based; whole columns = all rows). Text in quotes is ignored.
+const refCache = new Map();
+function formulaRefs(f, own) {
+  const key = own + "\u0001" + f;
+  let out = refCache.get(key);
+  if (out) return out;
+  out = [];
+  const src = String(f).replace(/"(?:[^"]|"")*"/g, '""');
+  const RE = /(?<![\w.$'])(?:'((?:[^']|'')+)'!|([A-Za-z0-9_.]+)!)?(\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?|\$?[A-Z]{1,3}:\$?[A-Z]{1,3})(?![\w(!])/gi;
+  for (const m of src.matchAll(RE)) {
+    const sheet = m[1] != null ? m[1].replace(/''/g, "'") : m[2] != null ? m[2] : own, ref = m[3].replace(/\$/g, "").toUpperCase();
+    try {
+      if (/^[A-Z]+:[A-Z]+$/.test(ref)) { const [p, q] = ref.split(":"); out.push({ sheet, r1: 0, r2: 1e9, c1: XLSX.utils.decode_col(p), c2: XLSX.utils.decode_col(q) }); }
+      else { const rg = XLSX.utils.decode_range(ref.includes(":") ? ref : ref + ":" + ref); out.push({ sheet, r1: rg.s.r, r2: rg.e.r, c1: rg.s.c, c2: rg.e.c }); }
+    } catch (_) {}
+  }
+  if (refCache.size > 50000) refCache.clear();
+  refCache.set(key, out);
+  return out;
+}
+// every formula cell of the workbook (kept until the formulas change)
+function formulaIndex(wb, stampKey) {
+  if (wb.__fx && wb.__fxKey === stampKey) return wb.__fx;
+  const all = [];
+  for (const n of wb.SheetNames) {
+    const ws = wb.Sheets[n];
+    for (const a of Object.keys(ws)) {
+      if (a[0] === "!" || !ws[a] || !ws[a].f) continue;
+      const rc = XLSX.utils.decode_cell(a);
+      all.push({ sheet: n, addr: a, refs: formulaRefs(ws[a].f, n), r: rc.r, c: rc.c });
+    }
+  }
+  wb.__fx = all; wb.__fxKey = stampKey;
+  return all;
+}
+const tick = () => new Promise((r) => setTimeout(r, 0));
+const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+// After an edit: recalculate only the formulas that (directly or through other formulas) read an edited cell.
+// Works in small steps so the page never freezes, even on big files (e.g. AR Aging's "Aging by Customer" SUMIFS).
+async function recalcEdited(k) {
   const s = state[k], wb = s.wbEdit;
   if (!wb) return;
   s.recalc = s.recalc || {};
   const tr = (n) => (s.recalc[n] = s.recalc[n] || new Set());
-  if (k === "ds") recalcUnitPlan(wb, s.edits, (sheet, addr) => tr(sheet).add(addr));
-  const sheets = new Set(Object.keys(s.edits || {}));
-  if (k === "ds") wb.SheetNames.filter((n) => /weekly/i.test(n)).forEach((n) => sheets.add(n));
-  // sheets with formulas that read one of these sheets (e.g. Weekly Schedule = SUMIFS over 'Unreleased Checks')
-  const reads = (n, t) => Object.keys(wb.Sheets[n]).some((a) => a[0] !== "!" && wb.Sheets[n][a] && wb.Sheets[n][a].f && wb.Sheets[n][a].f.includes(t + "!"));
-  for (let grew = true; grew; ) {
-    grew = false;
-    for (const n of wb.SheetNames) if (!sheets.has(n) && [...sheets].some((t) => reads(n, `'${t.replace(/'/g, "''")}'`) || (/^[A-Za-z0-9_.]+$/.test(t) && reads(n, t)))) { sheets.add(n); grew = true; }
-  }
-  for (let round = 0; round < 4; round++) {
-    let changed = false;
-    sheets.forEach((n) => { if (recalcSheet(wb.Sheets[n], tr(n), wb)) changed = true; });
-    if (!changed) break;
+  let front = [];
+  for (const [sheet, cells] of Object.entries(s.edits || {})) for (const a of Object.keys(cells)) { const rc = XLSX.utils.decode_cell(a); front.push({ sheet, r: rc.r, c: rc.c }); }
+  if (k === "ds") recalcUnitPlan(wb, s.edits, (sheet, addr) => { tr(sheet).add(addr); const rc = XLSX.utils.decode_cell(addr); front.push({ sheet, r: rc.r, c: rc.c }); });
+  const fEdits = Object.values(s.edits || {}).reduce((n, m) => n + Object.values(m).filter((v) => v && typeof v === "object" && v.formula).length, 0);
+  const all = formulaIndex(wb, `${(s.ops || []).length}:${fEdits}`);
+  let t = nowMs();
+  for (let round = 0; front.length && round < 30; round++) {
+    const bySheet = new Map();
+    for (const d of front) { if (!bySheet.has(d.sheet)) bySheet.set(d.sheet, []); bySheet.get(d.sheet).push(d); }
+    const reads = (x) => x.refs.some((rf) => { const ds = bySheet.get(rf.sheet); return ds && ds.some((d) => d.r >= rf.r1 && d.r <= rf.r2 && d.c >= rf.c1 && d.c <= rf.c2); });
+    const cache = new Map(), next = [];
+    for (let i = 0; i < all.length; i++) {
+      if (nowMs() - t > 30) { await tick(); t = nowMs(); }          // let the page breathe
+      const x = all[i];
+      if (!reads(x)) continue;
+      const ws = wb.Sheets[x.sheet], cell = ws[x.addr];
+      if (!cell || !cell.f) continue;
+      let v;
+      try { v = evalSimpleFormula(cell.f, ws, wb, cache); } catch (_) { continue; }
+      if (typeof cell.v !== "number" || Math.abs(cell.v - v) > 1e-9) {
+        cell.v = v; cell.t = "n"; delete cell.w;
+        tr(x.sheet).add(x.addr);
+        next.push({ sheet: x.sheet, r: x.r, c: x.c });
+      }
+    }
+    front = next;
   }
 }
 
+const reingestJobs = {};
 function reingest(k) {
+  if (reingestJobs[k]) { reingestJobs[k].again = true; return reingestJobs[k].p; }
+  const job = (reingestJobs[k] = { again: false });
+  job.p = (async () => {
+    try { do { job.again = false; await reingestOnce(k); } while (job.again); }
+    finally { delete reingestJobs[k]; }
+  })();
+  return job.p;
+}
+async function reingestOnce(k) {
   const s = state[k], wb = s.wbEdit;
   try {
-    recalcEdited(k);
+    await recalcEdited(k);
     if (fe.k === k && !$("fe-modal").classList.contains("hidden")) renderEditor();   // show recalculated totals
     if (k === "ar" || k === "ap") {
       const sheetName = wb.SheetNames.find((n) => /^detail$/i.test(n)) || wb.SheetNames[0];
@@ -2748,7 +3191,7 @@ function beginRememberedEdit(td) {
       if (!isNaN(n)) {
         if (k === "ds") { const i = +key.slice(1); if (key[0] === "a") s.rows[i].amount = n; else s.rows[i].units = n; renderDisposalMonths(); }
         else { s.byDate[key] = n; renderCashOutSources(); }
-        s.remEdited[key] = true; saved = false; renderFileList();
+        s.remEdited[key] = true; s.dirty = true; saved = false; renderFileList();
         if (report) refresh();
       }
     }
@@ -2835,19 +3278,27 @@ async function excelOf(k) {
 
 // ---- write the edits into the ORIGINAL files (called from Save summary)
 async function writeEditedOriginals() {
-  const todo = FILE_KINDS.map(([k]) => k).filter((k) => hasOriginal(k) && editCount(k) && state[k].handle);
+  let todo = FILE_KINDS.map(([x]) => x).filter((x) => hasOriginal(x) && (editCount(x) || state[x].syncOriginal) && state[x].handle);
   if (!todo.length) return { ok: true, written: [] };
-  // 1. permission to change each original (asked first, while the click is still fresh)
+  const written = [], skipped = [];
+  // 1. permission to change each original (asked first, while the click is still fresh); refused = only that file is skipped
+  const allowed = [];
   for (const k of todo) {
     const hnd = state[k].handle;
-    if ((await hnd.queryPermission({ mode: "readwrite" })) !== "granted" && (await hnd.requestPermission({ mode: "readwrite" })) !== "granted")
-      return { ok: false, msg: `No permission to update "${hnd.name}".` };
+    let ok = false;
+    try { ok = (await hnd.queryPermission({ mode: "readwrite" })) === "granted" || (await hnd.requestPermission({ mode: "readwrite" })) === "granted"; } catch (_) {}
+    if (ok) allowed.push(k); else skipped.push(`${hnd.name} (no permission to change it, or it was moved)`);
   }
+  todo = allowed;
   // 2. a backup needs the save folder
-  if (!(await folderReady())) return { ok: false, msg: "Connect the save folder first (bottom of the sidebar) so a backup of each original file can be kept before it is updated." };
-  const written = [], skipped = [];
+  if (todo.length && !(await folderReady())) return { ok: false, msg: "Connect the save folder first (bottom of the sidebar) so a backup of each original file can be kept before it is updated." };
   for (const k of todo) {
     const s = state[k], hnd = s.handle;
+    // changed in Excel after it was uploaded / linked? then ask before replacing it
+    try {
+      const now = (await hnd.getFile()).lastModified;
+      if (s.origSeen && now > s.origSeen + 2000 && !confirm(`"${hnd.name}" was changed outside the system (${new Date(now).toLocaleString("en-PH")}) after it was uploaded or linked.\n\nOK = replace it with the system's version (a backup of it is kept first)\nCancel = leave the original as it is`)) { skipped.push(`${hnd.name} (changed in Excel — left as it is)`); continue; }
+    } catch (_) { skipped.push(`${hnd.name} (could not be opened — moved or renamed?)`); continue; }
     if (!/\.(xlsx|xlsm)$/i.test(hnd.name)) { toast(`"${escapeHtml(hnd.name)}" is not an .xlsx file — its edits stay in the system only.`, true, 7000); continue; }
     // rebuild the file with ExcelJS: only the edited cells change (and turn yellow)
     const wb = await excelOf(k);
@@ -2861,17 +3312,21 @@ async function writeEditedOriginals() {
       continue;
     }
     // backup once per session, then overwrite the original
-    if (!s.backedUp) {
+    if (s.backedUp !== hnd.name) {
       if (!uploadBatch) uploadBatch = batchFolderName();
       const dot = hnd.name.lastIndexOf("."), bname = await uniqueName([UPLOAD_DIR, uploadBatch], `${hnd.name.slice(0, dot)} (before edit)${hnd.name.slice(dot)}`);
-      await writeTo([UPLOAD_DIR, uploadBatch], bname, s.buffer);
-      s.backedUp = true; s.backupAt = `${UPLOAD_DIR}/${uploadBatch}/${bname}`;
+      let orig = s.buffer;
+      try { orig = await (await hnd.getFile()).arrayBuffer(); } catch (_) {}
+      await writeTo([UPLOAD_DIR, uploadBatch], bname, orig);
+      s.backedUp = hnd.name; s.backupAt = `${UPLOAD_DIR}/${uploadBatch}/${bname}`;
     }
     const w = await hnd.createWritable(); await w.write(out); await w.close();
+    try { s.origSeen = (await hnd.getFile()).lastModified; await rememberOriginal(k, hnd, s.origSeen); } catch (_) {}
+    s.syncOriginal = false;
     // the updated file is now the original; keep the edited cells marked as written
     for (const [sheet, cells] of Object.entries(s.edits)) { s.written[sheet] = s.written[sheet] || {}; Object.keys(cells).forEach((a) => (s.written[sheet][a] = true)); }
     s.buffer = out instanceof ArrayBuffer ? out : out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
-    s.edits = {}; s.recalc = {}; s.ops = []; s.copySaved = false;
+    s.edits = {}; s.recalc = {}; s.ops = []; s.editedSave = true;   // the edited copy in Uploaded Files is kept by the shared save
     written.push(`${hnd.name}${s.backupAt ? " (backup: " + s.backupAt + ")" : ""}`);
   }
   return { ok: true, written, skipped };
@@ -2960,11 +3415,12 @@ document.addEventListener("keydown", (e) => {
   $("fe-modal").classList.add("hidden");
 });
 
-// V3.4 shared folder / several users
+// V3.6 several people at the same time
 renderUser();
 $("btn-user").onclick = () => askUserName();
-window.addEventListener("pagehide", () => { if (lockInfo && lockIsMine(lockInfo) && baseDir) baseDir.removeEntry(LOCK_FILE).catch(() => {}); });
-setInterval(() => { if (baseDir && !(lockInfo && lockIsMine(lockInfo))) refreshLock(); }, 60000);   // others: re-check the lock every minute
+$("btn-final").onclick = finalizeWeek;
+$("btn-refresh").onclick = async () => { if (!baseDir) { toast("Connect the shared FILES folder first (bottom of the sidebar).", true, 5000); return; } await loadShared(); toast("Showing everyone's latest updates" + (SHARED_KINDS.some((k) => state[k].dirty) || bankDirty ? "<small>Parts you changed and have not saved yet were kept as yours.</small>" : "")); };
+renderBankInfo();
 
 // show unexpected errors instead of failing silently
 window.addEventListener("error", (e) => { if (e && e.message) toast("Something went wrong:<small>" + escapeHtml(e.message) + "</small>", true, 10000); });

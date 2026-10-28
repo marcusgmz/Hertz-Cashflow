@@ -456,3 +456,18 @@ td.rem { white-space: normal !important; min-width: 180px; max-width: 320px; col
 
 /* version label under the logo */
 .app-version { font-size: 11px; color: #9aa1b2; margin: -6px 0 10px 2px; letter-spacing: .02em; }
+
+/* V3.6: who updated each shared part */
+.fi-by { display: block; font-size: 10.5px; color: #8a93a6; margin-top: 1px; }
+.file-item .fi-by:empty { display: none; }
+
+/* spinner inside the blue status line */
+.lock-banner .spin { border-color: rgba(29,74,122,.25); border-top-color: #1d4a7a; margin-right: 0; }
+
+/* V3.6 sidebar files: part name (+ edits badge) / file name / who saved it */
+.file-list .file-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 6px; row-gap: 1px; padding: 6px 8px; }
+.file-list .fi-name { grid-column: 1; font-size: 11px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-list .fi-badge { grid-column: 2; grid-row: 1; }
+.file-list .fi-sub { display: block; grid-column: 1 / -1; font-size: 9.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-list .fi-by { grid-column: 1 / -1; font-size: 9.5px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-list .fi-dirty .fi-by { color: #a05a00; font-weight: 600; }
