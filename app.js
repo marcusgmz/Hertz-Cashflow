@@ -11,7 +11,8 @@ const state = {
   // Cash Out sources. byDate = { "YYYY-MM-DD": amount } (cash going out); from = "file" (uploaded now) or "saved" (from the last saved summary)
   ln: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Loan Payment Schedule
   uc: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Unreleased Checks
-  po: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Projected Cash Outflow   // Disposal Schedule (Proceeds from Disposal)   // Cash Flow Report (Retail trend)
+  po: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Projected Cash Outflow
+  un: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Unidentified Collection (Cash In: actual collections by date)   // Disposal Schedule (Proceeds from Disposal)   // Cash Flow Report (Retail trend)
 };
 // Opening cash balances (beginning balance of Week 1). USD amounts are converted at 62.50 PHP per USD.
 const USD_RATE = 62.5;
@@ -236,7 +237,7 @@ async function folderReady() {
    ============================================================ */
 const FIELD_LABELS = { party: "Customer / Vendor", due: "Due date", amount: "Amount (invoice)", type: "Invoice type", vat: "VAT type", inv: "Invoice no.", proj: "Projected date", rem: "Remarks" };
 const AR_ONLY_FIELDS = ["type", "vat", "inv", "proj", "rem"];
-const KIND_LABEL = { ar: "AR_Aging", ap: "AP_Aging", cf: "CashFlow_Report", ds: "Disposal_Schedule", ln: "Loan_Payment_Schedule", uc: "Unreleased_Checks", po: "Projected_Cash_Outflow" };
+const KIND_LABEL = { ar: "AR_Aging", ap: "AP_Aging", cf: "CashFlow_Report", ds: "Disposal_Schedule", ln: "Loan_Payment_Schedule", uc: "Unreleased_Checks", po: "Projected_Cash_Outflow", un: "Unidentified_Collection" };
 
 // Reads the file, waits for its handler, then marks the part as changed by this user (unless it came from FILES/Current).
 function readInto(reader, file, kind) {
@@ -702,7 +703,30 @@ function parseProjected(wb) {
   throw new Error('No sheet with "From" / "To" week rows.');
 }
 
-const CO_META = { ln: { label: "Loan payments", parse: parseLoans }, uc: { label: "Unreleased checks", parse: parseChecks }, po: { label: "Projected payments", parse: parseProjected } };
+// Unidentified Collection: a "Date" and an "Amount" heading, one line per actual collection (full amount, no EWT).
+function parseUnidentified(wb) {
+  for (const name of wb.SheetNames) {
+    const g = gridOf(wb.Sheets[name]);
+    const hi = g.slice(0, 20).findIndex((r) => r.some((c) => isTxt(c, /date/i)) && r.some((c) => isTxt(c, /amount/i)));
+    if (hi < 0) continue;
+    const iD = g[hi].findIndex((c) => isTxt(c, /date/i)), iA = g[hi].findIndex((c) => isTxt(c, /amount/i));
+    const o = XLSX.utils.decode_range(wb.Sheets[name]["!ref"] || "A1").s, lines = [];
+    const byDate = {}; let n = 0, total = 0, undated = 0;
+    g.slice(hi + 1).forEach((r, j) => {
+      const a = r[iA];
+      if (typeof a !== "number") return;
+      const d = parseDate(r[iD]);
+      lines.push({ r: o.r + hi + 1 + j, date: d });
+      if (!d) { undated += a; return; }
+      const k = toISO(d); byDate[k] = (byDate[k] || 0) + a; n++; total += a;
+    });
+    if (n) return { byDate, n, total, undated, what: "collections", loc: { sheet: name, hdr: o.r + hi, cAmt: o.c + iA, lines } };
+  }
+  throw new Error('No sheet with "Date" and "Amount" headings.');
+}
+
+const CO_META = { ln: { label: "Loan payments", parse: parseLoans }, uc: { label: "Unreleased checks", parse: parseChecks }, po: { label: "Projected payments", parse: parseProjected },
+  un: { label: "Unidentified Collection", parse: parseUnidentified, cashIn: true } };   // un: same handling, but a Cash In row
 function coInfo(res) {
   const ds = Object.keys(res.byDate).sort();
   const f = (s) => new Date(s + "T00:00:00").toLocaleDateString("en-PH", { month: "short", day: "numeric", year: "numeric" });
@@ -717,7 +741,7 @@ function handleCashOut(key, file) {
       Object.assign(state[key], { byDate: res.byDate, file, buffer: e.target.result, saved: false, saveErr: null, info: coInfo(res), from: "file", rows: [1] });
       $("drop-" + key).classList.add("loaded");
       await saveOriginal(key);
-      $("mstat-" + key).innerHTML = `<b>${escapeHtml(file.name)}</b><br>${state[key].info}` + (res.undated ? `<br><span class="warn">${fmtNum(res.undated)} without a clearing date (not placed)</span>` : "");
+      $("mstat-" + key).innerHTML = `<b>${escapeHtml(file.name)}</b><br>${state[key].info}` + (res.undated ? `<br><span class="warn">${fmtNum(res.undated)} without a ${key === "uc" ? "clearing " : ""}date (not placed)</span>` : "");
       renderCashOutSources();
       saved = false;
       refresh(); renderFileList();
@@ -730,7 +754,7 @@ function handleCashOut(key, file) {
   return readInto(reader, file, key);
 }
 function renderCashOutSources() {
-  const rows = Object.entries(CO_META).map(([k, m]) => {
+  const rows = Object.entries(CO_META).filter(([, m]) => !m.cashIn).map(([k, m]) => {
     const s = state[k], has = Object.keys(s.byDate).length > 0;
     const src = !has ? '<span class="muted">Not loaded</span>' : s.from === "file" ? `Uploaded: ${escapeHtml(s.file.name)}` : `From the last saved summary${s.savedFrom ? " (" + escapeHtml(s.savedFrom) + ")" : ""}`;
     return `<tr><td class="l"><b>${m.label}</b></td><td class="l">${src}</td><td class="l">${has ? s.info : ""}</td>
@@ -981,6 +1005,7 @@ function buildBase() {
   base.retail = retailForecast(wk);
   base.disposal = disposalForecast(wk, start);
   for (const [k, src] of Object.entries(CO_SRC)) base[k] = wk.map((w) => -sumDates(state[src].byDate, w.start, w.end));
+  for (const [k, src] of Object.entries(CI_SRC)) base[k] = wk.map((w) => sumDates(state[src].byDate, w.start, w.end));   // dates outside the 13 weeks are not counted
   return { start, weeks, wk, ar, ap, arRes, rules, base };
 }
 
@@ -1003,6 +1028,7 @@ function compute(r) {
 // Row lists follow the template's Summary sheet. Cash In rows were given by the user; Cash Out rows are still pending.
 const CASH_IN = [
   ["arCorp", "AR Corporate"],
+  ["unident", "Unidentified Collection"],
   ["retail", "Retail (Credit Card)"],
   ["loan", "Loan Proceeds"],
   ["disposal", "Proceeds from Disposal"],
@@ -1010,6 +1036,15 @@ const CASH_IN = [
 ];
 const CASH_OUT = [["loans", "Loan payments"], ["checks", "Unreleased checks"], ["projout", "Projected payments"]];
 const CO_SRC = { loans: "ln", checks: "uc", projout: "po" };   // Cash Out row -> source in state
+const CI_SRC = { unident: "un" };                                // Cash In row -> source in state (dated amounts)
+// a template row missing from a saved row order (e.g. a row added in a later version) goes right after the row before it
+function addMissingRows(ord) {
+  for (const [list, sec] of [[CASH_IN, "in"], [CASH_OUT, "out"]]) list.forEach(([k], i) => {
+    if (ord.in.includes(k) || ord.out.includes(k)) return;
+    const prev = i ? list[i - 1][0] : null, s = prev && ord.out.includes(prev) ? "out" : prev && ord.in.includes(prev) ? "in" : sec, at = prev ? ord[s].indexOf(prev) : -1;
+    if (at >= 0) ord[s].splice(at + 1, 0, k); else ord[s].push(k);
+  });
+}
 // Display order of the rows inside each section. Template rows are fixed; rows added by the user ("c:<id>")
 // can be dragged to any position, in either section. Amounts keep their own sign (Deduct -, Add +).
 const rowOrder = { in: CASH_IN.map(([k]) => k), out: CASH_OUT.map(([k]) => k) };
@@ -1041,8 +1076,8 @@ function rowTotal(row, c) { return row.total ? c[row.total] : c.v[row.k].reduce(
    ============================================================ */
 // The Summary is shown as soon as ANY source file is uploaded (AR Aging is not required first).
 function hasUploads() {
-  return !!(state.ar.rows.length || state.ap.rows.length || ["cf", "ds", "ln", "uc", "po"].some((k) => state[k].buffer)
-    || state.ds.rows.length || ["ln", "uc", "po"].some((k) => Object.keys(state[k].byDate).length));   // also schedules kept from the last summary
+  return !!(state.ar.rows.length || state.ap.rows.length || ["cf", "ds", "ln", "uc", "po", "un"].some((k) => state[k].buffer)
+    || state.ds.rows.length || ["ln", "uc", "po", "un"].some((k) => Object.keys(state[k].byDate).length));   // also schedules kept from the last summary
 }
 function refresh() {
   if (!$("opt-start").value || !hasUploads()) return;
@@ -1487,8 +1522,7 @@ function applyCarryState(st) {
   const map = (k) => (k.startsWith("c:") ? (idMap[k.slice(2)] ? "c:" + idMap[k.slice(2)] : null) : fixed.has(k) ? k : null);
   const ord = (a) => (a || []).map(map).filter(Boolean);
   const order = { in: ord(st.order && st.order.in), out: ord(st.order && st.order.out) };
-  CASH_IN.forEach(([k]) => { if (!order.in.includes(k) && !order.out.includes(k)) order.in.push(k); });
-  CASH_OUT.forEach(([k]) => { if (!order.in.includes(k) && !order.out.includes(k)) order.out.push(k); });
+  addMissingRows(order);
   customRows.forEach((r) => { const k = "c:" + r.id; if (!order.in.includes(k) && !order.out.includes(k)) order.in.push(k); });
   rowOrder.in = order.in; rowOrder.out = order.out;
   for (const [k, m] of Object.entries(st.overrides || {})) overrides[k] = { ...m };
@@ -1717,9 +1751,9 @@ async function addDetailSheets(dst, r) {
   }
 
   // Cash Out: one sheet per file (amounts are cash going out: the Summary shows them negative)
-  const CO_SHEET = { loans: ["ln", "Loan Payments"], checks: ["uc", "Unreleased Checks"], projout: ["po", "Projected Payments"] };
+  const CO_SHEET = { unident: ["un", "Unidentified Collection"], loans: ["ln", "Loan Payments"], checks: ["uc", "Unreleased Checks"], projout: ["po", "Projected Payments"] };
   for (const [rk, [k, name]] of Object.entries(CO_SHEET)) {
-    const s = state[k];
+    const s = state[k], neg = CO_META[k].cashIn ? "" : "-";
     if (!Object.keys(s.byDate).length) continue;
     try {
       if (s.buffer) {
@@ -1736,15 +1770,15 @@ async function addDetailSheets(dst, r) {
           const W = rg.e.c + 2, hdr = loc.hdr + 1;
           addHead(ws, hdr, W, "Summary week (Monday)", 14);
           let first = Infinity, last = 0;
-          for (const x of loc.lines) { const row = x.r + 1; first = Math.min(first, row); last = Math.max(last, row); addCell(ws, row, W, x.date ? mondayOf(x.date) : "No clearing date"); }
-          if (last) links[rk] = (L) => "-" + sumifs(name, colRange(loc.cAmt + 1, first, last), colRange(W, first, last), L);
+          for (const x of loc.lines) { const row = x.r + 1; first = Math.min(first, row); last = Math.max(last, row); addCell(ws, row, W, x.date ? mondayOf(x.date) : k === "uc" ? "No clearing date" : "No date"); }
+          if (last) links[rk] = (L) => neg + sumifs(name, colRange(loc.cAmt + 1, first, last), colRange(W, first, last), L);
         }
       } else {
         const days = Object.keys(s.byDate).sort();
         const t = tableSheet(dst, name, `${CO_META[k].label} — kept in the last saved summary${s.savedFrom ? ` (${s.savedFrom})` : ""}`,
           [["Date", 12], ["Amount", 16], ["Summary week (Monday)", 14]],
           days.map((d) => { const dt = new Date(d + "T00:00:00"); return [dt, s.byDate[d], mondayOf(dt)]; }));
-        links[rk] = (L) => "-" + sumifs(name, colRange(2, t.first, t.last), colRange(3, t.first, t.last), L);
+        links[rk] = (L) => neg + sumifs(name, colRange(2, t.first, t.last), colRange(3, t.first, t.last), L);
       }
     } catch (e) { notes.push(`${name} sheet not added: ` + e.message); }
   }
@@ -1956,6 +1990,7 @@ async function saveSummaryInner(finalize) {
     $("last-saved").title = `${SUMMARY_DIR}/${LATEST_NAME}`;
     const chip = $("last-saved"); chip.classList.add("flash"); setTimeout(() => chip.classList.remove("flash"), 4000);
     toast(`✓ ${finalize ? "Week finalized" : "Saved"} at ${new Date().toLocaleTimeString("en-PH", { hour: "numeric", minute: "2-digit" })}<small>${shared.length ? "Shared: " + shared.map(escapeHtml).join(", ") + "<br>" : ""}Summary with everyone's latest work: ${SUMMARY_DIR}/${LATEST_NAME}${dated ? `<br>Dated copy kept: ${SUMMARY_DIR}/${escapeHtml(dated)}` : ""}${copies.length ? `<br>Uploaded files copied to ${UPLOAD_DIR}/${escapeHtml(uploadBatch)}: ${copies.map(escapeHtml).join(", ")}` : ""}${editedCopies.length ? `<br>Edited file(s) kept in ${UPLOAD_DIR}/${escapeHtml(uploadBatch)}: ${editedCopies.map(escapeHtml).join(", ")}` : ""}${wr.written.length ? "<br>Updated original file(s): " + wr.written.map(escapeHtml).join("; ") : ""}${wr.skipped && wr.skipped.length ? "<br>Not changed (kept in the system only): " + wr.skipped.map(escapeHtml).join("; ") : ""}</small>`, false, 10000);
+    if (wr.failed && wr.failed.length) setTimeout(() => toast("Original file NOT updated:<small>" + wr.failed.map(escapeHtml).join("<br>") + "</small>", true, 15000), 10500);
     saved = true;
   } finally { await releaseSaveLock(); }
 }
@@ -1971,15 +2006,15 @@ async function finalizeWeek() {
 /* ============================================================
    Several people, one shared cashflow (LAN folder FILES)
    FILES/Current/ holds the latest version of every part, each saved separately:
-     part-<ar|cf|ds|ln|uc|po>.json (+ <k>-file.<ext>)  source files with their edits
+     part-<ar|cf|ds|ln|uc|po|un>.json (+ <k>-file.<ext>)  source files with their edits
      part-bank.json   bank balances (Beginning Balance of Week 1)
      part-typed.json  typed amounts / added rows, cell by cell, with who typed them
    Opening the system loads all parts. Save re-reads them, writes only the parts you changed, and rebuilds
    Cashflow_Summary_LATEST.xlsx from everyone's latest work. "Finalize week" keeps a dated copy.
    ============================================================ */
 const CURRENT_DIR = "Current", LATEST_NAME = "Cashflow_Summary_LATEST.xlsx", SAVE_LOCK = "_saving.json";
-var SHARED_KINDS = ["ar", "cf", "ds", "ln", "uc", "po"];
-const PART_LABEL = { ar: "AR Aging", cf: "Cash Flow Report", ds: "Unit Disposals", ln: "Loan Payment Schedule", uc: "Unreleased Checks", po: "Projected Cash Outflow", bank: "Bank balances", typed: "Typed amounts / added rows" };
+var SHARED_KINDS = ["ar", "cf", "ds", "ln", "uc", "po", "un"];
+const PART_LABEL = { ar: "AR Aging", cf: "Cash Flow Report", ds: "Unit Disposals", ln: "Loan Payment Schedule", uc: "Unreleased Checks", po: "Projected Cash Outflow", un: "Unidentified Collection", bank: "Bank balances", typed: "Typed amounts / added rows" };
 const SESSION_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
 var sharedLoading = false;      // true while parts from FILES/Current are being read (not a change by this user)
 var sharedFound = false;        // FILES/Current had parts when the page connected
@@ -2081,15 +2116,14 @@ function adoptTyped(R) {
   const fixed = new Set([...CASH_IN, ...CASH_OUT].map(([k]) => k)), byUid = new Map(customRows.map((r) => [r.uid, "c:" + r.id]));
   const map = (k) => (k.startsWith("c:") ? byUid.get(k.slice(2)) || null : fixed.has(k) ? k : null);
   const ord = { in: ((R.order && R.order.in) || []).map(map).filter(Boolean), out: ((R.order && R.order.out) || []).map(map).filter(Boolean) };
-  CASH_IN.forEach(([k]) => { if (!ord.in.includes(k) && !ord.out.includes(k)) ord.in.push(k); });
-  CASH_OUT.forEach(([k]) => { if (!ord.in.includes(k) && !ord.out.includes(k)) ord.out.push(k); });
+  addMissingRows(ord);
   customRows.forEach((r) => { const k = "c:" + r.id; if (!ord.in.includes(k) && !ord.out.includes(k)) ord.in.push(k); });
   rowOrder.in = ord.in; rowOrder.out = ord.out;
   typedBase = typedNow();
 }
 
 // ---- one source part
-const INGEST = { ar: (f) => handleFile("ar", f), cf: (f) => handleCashflowReport(f), ds: (f) => handleDisposal(f), ln: (f) => handleCashOut("ln", f), uc: (f) => handleCashOut("uc", f), po: (f) => handleCashOut("po", f) };
+const INGEST = { ar: (f) => handleFile("ar", f), cf: (f) => handleCashflowReport(f), ds: (f) => handleDisposal(f), ln: (f) => handleCashOut("ln", f), uc: (f) => handleCashOut("uc", f), po: (f) => handleCashOut("po", f), un: (f) => handleCashOut("un", f) };
 function clearPart(k) {
   const s = state[k];
   if (k === "ds") Object.assign(s, { rows: [], file: null, buffer: null, from: "" });
@@ -2111,13 +2145,14 @@ async function loadPart(dir, k, p) {
     } else if (p.data && k === "ds") applyDisposalState(p.data, p.from || "shared");
     else if (p.data && CO_META[k]) applyCashOutState({ [k]: p.data }, p.from || "shared");
   }
-  Object.assign(s, { dirty: false, removed: false, sharedBy: p.by, sharedAt: p.at, copySaved: true });
+  Object.assign(s, { dirty: false, removed: false, sharedBy: p.by, sharedAt: p.at, copySaved: true, syncOriginal: !!p.refPending, refPendingShared: !!p.refPending });
   sharedSeen[k] = p.at;
   if (k === "ds") renderDisposalMonths();
   if (CO_META[k]) renderCashOutSources();
 }
 async function writePart(k) {
   const s = state[k], who = stamp2(), p = { kind: k, ...who };
+  if (s.syncOriginal && hasOriginal(k)) p.refPending = true;           // the original in Reference Folder still has to be updated
   if (s.removed || !hasFileData(k)) p.empty = true;
   else if (s.buffer) {
     let buf = s.buffer;
@@ -2358,14 +2393,14 @@ restoreFolder();
      those edits live in the saved summary only.
    ============================================================ */
 const FILE_KINDS = [
-  ["ar", "AR Aging"], ["ap", "AP Aging"], ["cf", "Cash Flow Report"], ["ds", "Unit Disposals"],
+  ["ar", "AR Aging"], ["un", "Unidentified Collection"], ["ap", "AP Aging"], ["cf", "Cash Flow Report"], ["ds", "Unit Disposals"],
   ["ln", "Loan Payment Schedule"], ["uc", "Unreleased Checks"], ["po", "Projected Cash Outflow"],
 ];
 const KIND_NAME = Object.fromEntries(FILE_KINDS);
 const startWork = () => {};      // V3.6: no "in use" lock — everyone can work at the same time
 const DISPATCH = {
   ar: (f) => (startWork(), handleFile("ar", f)), ap: (f) => (startWork(), handleFile("ap", f)), cf: (f) => (startWork(), handleCashflowReport(f)), ds: (f) => (startWork(), handleDisposal(f)),
-  ln: (f) => (startWork(), handleCashOut("ln", f)), uc: (f) => (startWork(), handleCashOut("uc", f)), po: (f) => (startWork(), handleCashOut("po", f)),
+  ln: (f) => (startWork(), handleCashOut("ln", f)), uc: (f) => (startWork(), handleCashOut("uc", f)), po: (f) => (startWork(), handleCashOut("po", f)), un: (f) => (startWork(), handleCashOut("un", f)),
 };
 function resetFileEdits(k) { Object.assign(state[k], { edits: {}, wbEdit: null, written: {}, backedUp: false, remEdited: {}, recalc: {}, ops: [], copySaved: false }); }
 const hasOriginal = (k) => !!(state[k].buffer);
@@ -2488,7 +2523,7 @@ function openEditor(k) {
   if (rem) { fe.sheet = null; $("fe-tabs").innerHTML = ""; }
   else {
     const wb = editWorkbook(k);
-    const preferred = { ar: /^detail$/i, ap: /^detail$/i, cf: /^summary$/i, ds: /weekly/i, ln: /^detail$/i, uc: /unreleased/i, po: /./ }[k];
+    const preferred = { ar: /^detail$/i, ap: /^detail$/i, cf: /^summary$/i, ds: /weekly/i, ln: /^detail$/i, uc: /unreleased/i, po: /./, un: /./ }[k];
     fe.sheet = wb.SheetNames.find((n) => preferred.test(n)) || wb.SheetNames[0];
     renderFeTabs();
   }
@@ -2530,7 +2565,7 @@ function dispVal(v, yearCol, plain) {
   return v.toLocaleString("en-PH", { maximumFractionDigits: 6 });
 }                                   // value as shown = value used by the filter
 // Summary row fed by each file; typed amounts on that row (Edit mode / carried from the last save) hide file changes
-const KIND_ROW = { ar: ["arCorp", "AR Corporate"], cf: ["retail", "Retail (Credit Card)"], ds: ["disposal", "Proceeds from Disposal"], ln: ["loans", "Loan payments"], uc: ["checks", "Unreleased checks"], po: ["projout", "Projected payments"] };
+const KIND_ROW = { ar: ["arCorp", "AR Corporate"], cf: ["retail", "Retail (Credit Card)"], ds: ["disposal", "Proceeds from Disposal"], ln: ["loans", "Loan payments"], uc: ["checks", "Unreleased checks"], po: ["projout", "Projected payments"], un: ["unident", "Unidentified Collection"] };
 function renderOverrideWarning() {
   const box = $("fe-warn"), kr = KIND_ROW[fe.k], ov = kr && overrides[kr[0]];
   const ws = ov && report ? report.wk.filter((w) => ov[toISO(w.start)] !== undefined) : [];
@@ -3236,7 +3271,12 @@ function replayInserts(wb, ops) {
 function xlFeatures(buf) {
   const cat = (k) => /pivot/i.test(k) ? "pivot tables" : /\/charts\//i.test(k) ? "charts" : /threadedComment/i.test(k) ? "threaded comments"
     : /comments\d*\.xml/i.test(k) ? "comments" : /\/drawings\/drawing/i.test(k) ? "drawings / shapes" : /vbaProject/i.test(k) ? "macros" : /persons|documenttasks/i.test(k) ? "tasks / @mentions" : null;
-  try { return new Set((XLSX.read(buf, { type: "array", bookFiles: true, sheetRows: 1 }).keys || []).map(cat).filter(Boolean)); } catch (_) { return new Set(); }
+  // empty parts (a drawing with no shapes, a list with no people) are left out: nothing is lost with them
+  const empty = (f) => { try { const x = typeof f.content === "string" ? f.content : new TextDecoder().decode(f.content); return /\/drawings\/drawing/i.test(f.name || "") ? !/Anchor[\s>]/.test(x) : /persons/i.test(f.name || "") ? !/<[\w:]*person[\s>]/i.test(x) : false; } catch (_) { return false; } };
+  try {
+    const w = XLSX.read(buf, { type: "array", bookFiles: true, sheetRows: 1 }), files = w.files || {};
+    return new Set((w.keys || []).filter((k) => !(files[k] && empty(Object.assign({ name: k }, files[k], { name: k })))).map(cat).filter(Boolean));
+  } catch (_) { return new Set(); }
 }
 
 // The uploaded file as it is now in the system (inserted lines and edits included; edited cells yellow), as ExcelJS.
@@ -3276,11 +3316,46 @@ async function excelOf(k) {
   return wb;
 }
 
+// ---- the shared Reference Folder inside FILES: Save summary updates the source file kept there (same file name), for every user
+const REF_DIRS = ["Reference Folder", "Reference Files"];
+async function findReferenceFile(name) {
+  if (!name || !baseDir) return null;
+  for (const d of REF_DIRS) {
+    try { return await (await baseDir.getDirectoryHandle(d)).getFileHandle(name); } catch (_) {}
+  }
+  return null;
+}
+// "~$name" next to the file = it is open in Excel (Excel shortens long names by 2 characters)
+async function refLockFile(name) {
+  if (!baseDir) return false;
+  for (const d of REF_DIRS) {
+    let dir; try { dir = await baseDir.getDirectoryHandle(d); } catch (_) { continue; }
+    for (const n of ["~$" + name, "~$" + name.slice(2)]) { try { await dir.getFileHandle(n); return true; } catch (_) {} }
+  }
+  return false;
+}
+async function attachReferenceFiles() {
+  if (!(await folderReady())) return;
+  for (const [k] of FILE_KINDS) {
+    const s = state[k];
+    if (!hasOriginal(k) || !(editCount(k) || s.syncOriginal) || !s.file) continue;
+    const ref = await findReferenceFile(s.file.name);
+    if (!ref) continue;
+    let same = false; try { same = !!s.handle && (await s.handle.isSameEntry(ref)); } catch (_) {}
+    if (same) { s.inRef = true; continue; }
+    // the Reference Folder copy is THE original (an older link on this computer, e.g. a moved file, is replaced)
+    s.handle = ref; s.inRef = true; s.backedUp = false;
+    s.origSeen = s.file.lastModified || 0;                  // changed in Excel after this version was read? then ask first
+    rememberOriginal(k, ref, s.origSeen);
+  }
+}
+
 // ---- write the edits into the ORIGINAL files (called from Save summary)
 async function writeEditedOriginals() {
+  await attachReferenceFiles();
   let todo = FILE_KINDS.map(([x]) => x).filter((x) => hasOriginal(x) && (editCount(x) || state[x].syncOriginal) && state[x].handle);
   if (!todo.length) return { ok: true, written: [] };
-  const written = [], skipped = [];
+  const written = [], skipped = [], failed = [];
   // 1. permission to change each original (asked first, while the click is still fresh); refused = only that file is skipped
   const allowed = [];
   for (const k of todo) {
@@ -3320,16 +3395,25 @@ async function writeEditedOriginals() {
       await writeTo([UPLOAD_DIR, uploadBatch], bname, orig);
       s.backedUp = hnd.name; s.backupAt = `${UPLOAD_DIR}/${uploadBatch}/${bname}`;
     }
-    const w = await hnd.createWritable(); await w.write(out); await w.close();
+    if (s.inRef && (await refLockFile(hnd.name)) && !confirm(`"${hnd.name}" looks open in Excel (on this or another computer).\n\nClose it in Excel first, then click OK to update it.\nCancel = update it on the next Save summary.`)) {
+      s.syncOriginal = true; failed.push(`${hnd.name} (open in Excel — it is updated on the next Save summary)`); continue;
+    }
+    let wrote = false, err = "";
+    for (let t = 0; t < 2 && !wrote; t++) {
+      try { const w = await hnd.createWritable(); await w.write(out); await w.close(); wrote = true; }
+      catch (e) { err = e && (e.name || e.message) || String(e); if (!t && !confirm(`"${hnd.name}" could not be updated (${err}). It is probably open in Excel.\n\nClose it in Excel, then click OK to try again.\nCancel = update it on the next Save summary.`)) break; }
+    }
+    if (!wrote) { s.syncOriginal = true; failed.push(`${hnd.name} (could not be written: ${err} — it is updated on the next Save summary)`); continue; }
     try { s.origSeen = (await hnd.getFile()).lastModified; await rememberOriginal(k, hnd, s.origSeen); } catch (_) {}
     s.syncOriginal = false;
+    if (s.refPendingShared) { s.refPendingShared = false; s.dirty = true; }   // tell everyone it is done (rewrites the shared part)
     // the updated file is now the original; keep the edited cells marked as written
     for (const [sheet, cells] of Object.entries(s.edits)) { s.written[sheet] = s.written[sheet] || {}; Object.keys(cells).forEach((a) => (s.written[sheet][a] = true)); }
     s.buffer = out instanceof ArrayBuffer ? out : out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
     s.edits = {}; s.recalc = {}; s.ops = []; s.editedSave = true;   // the edited copy in Uploaded Files is kept by the shared save
-    written.push(`${hnd.name}${s.backupAt ? " (backup: " + s.backupAt + ")" : ""}`);
+    written.push(`${s.inRef ? "Reference Folder/" : ""}${hnd.name}${s.backupAt ? " (backup: " + s.backupAt + ")" : ""}`);
   }
-  return { ok: true, written, skipped };
+  return { ok: true, written, skipped, failed };
 }
 
 // Upload pop-up

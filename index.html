@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=3.6.10">
+<link rel="stylesheet" href="style.css?v=3.7.2">
 </head>
 <body>
 <div class="shell">
@@ -16,7 +16,7 @@
   <!-- ============ SIDEBAR: logo, navigation, folder, uploads ============ -->
   <aside class="sidebar">
     <img class="logo-img" src="logo.png" alt="Hertz">
-    <div class="app-version" title="Several people can work at the same time; Save combines everyone's work (FILES/Current)">Version 3.6</div>
+    <div class="app-version" title="Several people can work at the same time; Save combines everyone's work (FILES/Current)">Version 3.7</div>
 
     <div class="side-group">
       <div class="side-title">Menu</div>
@@ -329,6 +329,11 @@
         <label class="btn outline small" for="file-ar">Choose file</label>
         <input type="file" id="file-ar" accept=".xlsx,.xls,.xlsm,.csv" hidden>
       </div>
+      <div class="um-row drop" id="drop-un">
+        <div class="um-info"><div class="um-label">Unidentified Collection <span class="muted">(Cash In · actual collections by date)</span></div><div class="um-status" id="mstat-un">No file chosen</div></div>
+        <label class="btn outline small" for="file-un">Choose file</label>
+        <input type="file" id="file-un" accept=".xlsx,.xls,.xlsm" hidden>
+      </div>
       <div class="um-row drop hidden" id="drop-ap"><!-- AP Aging: not used (hidden) -->
         <div class="um-info"><div class="um-label">AP Aging</div><div class="um-status" id="mstat-ap">No file chosen</div></div>
         <label class="btn outline small" for="file-ap">Choose file</label>
@@ -408,6 +413,6 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
-<script src="app.js?v=3.6.10"></script>
+<script src="app.js?v=3.7.2"></script>
 </body>
 </html>
