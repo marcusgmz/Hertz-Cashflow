@@ -12,6 +12,7 @@ const state = {
   ln: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Loan Payment Schedule
   uc: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Unreleased Checks
   po: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Projected Cash Outflow
+  ci: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Cash In file: Loan Proceeds + Advances from Affiliates. byDate keys "loan|YYYY-MM-DD" / "affiliate|YYYY-MM-DD"
   un: { byDate: {}, file: null, buffer: null, saved: false, info: "", from: "" },   // Unidentified Collection (Cash In: actual collections by date)   // Disposal Schedule (Proceeds from Disposal)   // Cash Flow Report (Retail trend)
 };
 // Opening cash balances (beginning balance of Week 1). USD amounts are converted at 62.50 PHP per USD.
@@ -99,6 +100,10 @@ const HAS_FS = "showDirectoryPicker" in window;
 function fsUnavailableReason() {
   if (HAS_FS) return "";
   if (!window.isSecureContext) return `This page was opened as ${location.protocol}//${location.host || ""} — browsers turn off folder access on plain "http" addresses. Open the system from its file path instead (e.g. Z:\\Hertz\\V3.6\\index.html or \\\\SERVER\\Hertz\\V3.6\\index.html), or use https.`;
+  const ua = navigator.userAgent || "", ios = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  if (ios) return "iPhone and iPad browsers cannot save into folders (Apple does not allow it). Use a computer (Windows or Mac) with Google Chrome or Microsoft Edge.";
+  if (/Macintosh/.test(ua) && /Safari/.test(ua) && !/Chrome|Chromium|Edg\//.test(ua)) return "Safari cannot save into folders. On this Mac, open the system in Google Chrome or Microsoft Edge (free downloads), then click Connect folder and choose the shared FILES folder (Finder: Go > Connect to Server).";
+  if (/Firefox/.test(ua)) return "Firefox cannot save into folders. Use Google Chrome or Microsoft Edge (up to date).";
   return "This browser cannot save into folders. Use Google Chrome or Microsoft Edge (up to date).";
 }
 
@@ -237,7 +242,7 @@ async function folderReady() {
    ============================================================ */
 const FIELD_LABELS = { party: "Customer / Vendor", due: "Due date", amount: "Amount (invoice)", type: "Invoice type", vat: "VAT type", inv: "Invoice no.", proj: "Projected date", rem: "Remarks" };
 const AR_ONLY_FIELDS = ["type", "vat", "inv", "proj", "rem"];
-const KIND_LABEL = { ar: "AR_Aging", ap: "AP_Aging", cf: "CashFlow_Report", ds: "Disposal_Schedule", ln: "Loan_Payment_Schedule", uc: "Unreleased_Checks", po: "Projected_Cash_Outflow", un: "Unidentified_Collection" };
+const KIND_LABEL = { ar: "AR_Aging", ap: "AP_Aging", cf: "CashFlow_Report", ds: "Disposal_Schedule", ln: "Loan_Payment_Schedule", uc: "Unreleased_Checks", po: "Projected_Cash_Outflow", un: "Unidentified_Collection", ci: "Cash_In" };
 
 // Reads the file, waits for its handler, then marks the part as changed by this user (unless it came from FILES/Current).
 function readInto(reader, file, kind) {
@@ -725,10 +730,50 @@ function parseUnidentified(wb) {
   throw new Error('No sheet with "Date" and "Amount" headings.');
 }
 
+// Cash In file: sheet "Loan Proceeds" (PN #, DATE, FROM, AMOUNT) and sheet "Advances from Affiliates"
+// (DM, DATE, FROM, CREDIT, ACCOUNT, TO, DEBIT, ACCOUNT). Advances: the amount after DEBIT (received by ECIHI),
+// only lines whose TO is ECIHI (Exclusive Cars International Holdings). Full amounts, placed in the week of their date.
+const CI_ROWS = { loan: "Loan Proceeds", affiliate: "Advances from Affiliates" };
+const isEcihi = (v) => /exclusive\s*cars|ecihi/i.test(String(v || ""));
+function parseCashIn(wb) {
+  const byDate = {}, sheets = []; let n = 0, total = 0, undated = 0, notOurs = 0;
+  for (const name of wb.SheetNames) {
+    const key = /loan/i.test(name) ? "loan" : /affiliate|advance/i.test(name) ? "affiliate" : null;
+    if (!key || sheets.some((x) => x.key === key)) continue;
+    const g = gridOf(wb.Sheets[name]);
+    const hi = g.slice(0, 20).findIndex((r) => r.some((c) => isTxt(c, /date/i)));
+    if (hi < 0) continue;
+    const H = g[hi], iD = H.findIndex((c) => isTxt(c, /date/i));
+    let iA = H.findIndex((c) => isTxt(c, /amount/i)), iTo = -1;
+    if (key === "affiliate") {
+      const iDeb = H.findIndex((c) => isTxt(c, /debit/i));
+      const after = H.findIndex((c, i) => i > iDeb && isTxt(c, /account|amount/i));
+      if (iDeb >= 0 && after >= 0) iA = after;
+      else if (iA < 0) iA = H.reduce((m, c, i) => (isTxt(c, /account|amount/i) ? i : m), -1);   // last amount column
+      iTo = H.findIndex((c) => isTxt(c, /^to$/i));
+    }
+    if (iA < 0) continue;
+    const o = XLSX.utils.decode_range(wb.Sheets[name]["!ref"] || "A1").s, lines = [];
+    g.slice(hi + 1).forEach((r, j) => {
+      const a = r[iA];
+      if (typeof a !== "number") return;
+      const d = parseDate(r[iD]), ours = iTo < 0 || isEcihi(r[iTo]);
+      lines.push({ r: o.r + hi + 1 + j, date: d, ours });
+      if (!ours) { notOurs += a; return; }
+      if (!d) { undated += a; return; }
+      const k = key + "|" + toISO(d); byDate[k] = (byDate[k] || 0) + a; n++; total += a;
+    });
+    sheets.push({ key, sheet: name, hdr: o.r + hi, cAmt: o.c + iA, lines });
+  }
+  if (!sheets.length) throw new Error('No "Loan Proceeds" or "Advances from Affiliates" sheet with a DATE heading.');
+  return { byDate, n, total, undated, notOurs, what: "receipts", loc: { sheets } };
+}
+
 const CO_META = { ln: { label: "Loan payments", parse: parseLoans }, uc: { label: "Unreleased checks", parse: parseChecks }, po: { label: "Projected payments", parse: parseProjected },
-  un: { label: "Unidentified Collection", parse: parseUnidentified, cashIn: true } };   // un: same handling, but a Cash In row
+  un: { label: "Unidentified Collection", parse: parseUnidentified, cashIn: true },
+  ci: { label: "Cash In (Loan Proceeds / Advances from Affiliates)", parse: parseCashIn, cashIn: true } };   // un: same handling, but a Cash In row
 function coInfo(res) {
-  const ds = Object.keys(res.byDate).sort();
+  const ds = Object.keys(res.byDate).map((d) => d.split("|").pop()).sort();
   const f = (s) => new Date(s + "T00:00:00").toLocaleDateString("en-PH", { month: "short", day: "numeric", year: "numeric" });
   return `${res.n.toLocaleString("en-PH")} ${res.what} · ${fmtNum(res.total)} · ${ds.length ? f(ds[0]) + " – " + f(ds[ds.length - 1]) : ""}`;
 }
@@ -741,7 +786,8 @@ function handleCashOut(key, file) {
       Object.assign(state[key], { byDate: res.byDate, file, buffer: e.target.result, saved: false, saveErr: null, info: coInfo(res), from: "file", rows: [1] });
       $("drop-" + key).classList.add("loaded");
       await saveOriginal(key);
-      $("mstat-" + key).innerHTML = `<b>${escapeHtml(file.name)}</b><br>${state[key].info}` + (res.undated ? `<br><span class="warn">${fmtNum(res.undated)} without a ${key === "uc" ? "clearing " : ""}date (not placed)</span>` : "");
+      $("mstat-" + key).innerHTML = `<b>${escapeHtml(file.name)}</b><br>${state[key].info}` + (res.undated ? `<br><span class="warn">${fmtNum(res.undated)} without a ${key === "uc" ? "clearing " : ""}date (not placed)</span>` : "")
+        + (res.notOurs ? `<br><span class="muted">${fmtNum(res.notOurs)} of advances not going to ECIHI (not counted)</span>` : "");
       renderCashOutSources();
       saved = false;
       refresh(); renderFileList();
@@ -1005,7 +1051,7 @@ function buildBase() {
   base.retail = retailForecast(wk);
   base.disposal = disposalForecast(wk, start);
   for (const [k, src] of Object.entries(CO_SRC)) base[k] = wk.map((w) => -sumDates(state[src].byDate, w.start, w.end));
-  for (const [k, src] of Object.entries(CI_SRC)) base[k] = wk.map((w) => sumDates(state[src].byDate, w.start, w.end));   // dates outside the 13 weeks are not counted
+  for (const [k, src] of Object.entries(CI_SRC)) { const m = srcDates(src); base[k] = wk.map((w) => sumDates(m, w.start, w.end)); }   // dates outside the 13 weeks are not counted
   return { start, weeks, wk, ar, ap, arRes, rules, base };
 }
 
@@ -1036,7 +1082,14 @@ const CASH_IN = [
 ];
 const CASH_OUT = [["loans", "Loan payments"], ["checks", "Unreleased checks"], ["projout", "Projected payments"]];
 const CO_SRC = { loans: "ln", checks: "uc", projout: "po" };   // Cash Out row -> source in state
-const CI_SRC = { unident: "un" };                                // Cash In row -> source in state (dated amounts)
+const CI_SRC = { unident: "un", loan: "ci|loan", affiliate: "ci|affiliate" };   // Cash In row -> source in state (dated amounts; "kind|row" = one row of a file)
+function srcDates(src) {
+  const [k, row] = src.split("|"), m = state[k].byDate;
+  if (!row) return m;
+  const out = {};
+  for (const [d, v] of Object.entries(m)) { const [r, day] = d.split("|"); if (r === row) out[day] = (out[day] || 0) + v; }
+  return out;
+}
 // a template row missing from a saved row order (e.g. a row added in a later version) goes right after the row before it
 function addMissingRows(ord) {
   for (const [list, sec] of [[CASH_IN, "in"], [CASH_OUT, "out"]]) list.forEach(([k], i) => {
@@ -1076,8 +1129,8 @@ function rowTotal(row, c) { return row.total ? c[row.total] : c.v[row.k].reduce(
    ============================================================ */
 // The Summary is shown as soon as ANY source file is uploaded (AR Aging is not required first).
 function hasUploads() {
-  return !!(state.ar.rows.length || state.ap.rows.length || ["cf", "ds", "ln", "uc", "po", "un"].some((k) => state[k].buffer)
-    || state.ds.rows.length || ["ln", "uc", "po", "un"].some((k) => Object.keys(state[k].byDate).length));   // also schedules kept from the last summary
+  return !!(state.ar.rows.length || state.ap.rows.length || ["cf", "ds", "ln", "uc", "po", "un", "ci"].some((k) => state[k].buffer)
+    || state.ds.rows.length || ["ln", "uc", "po", "un", "ci"].some((k) => Object.keys(state[k].byDate).length));   // also schedules kept from the last summary
 }
 function refresh() {
   if (!$("opt-start").value || !hasUploads()) return;
@@ -1500,7 +1553,7 @@ function xlLabel(k) {
 // Hand-entered items, kept in the saved file's document properties (no extra sheet) so next week can pick them up.
 function carryState() {
   const cutoff = report ? addDays(report.start, -28) : null;               // forget weeks that are long past
-  const keep = (m) => Object.fromEntries(Object.entries(m || {}).filter(([d]) => !cutoff || new Date(d + "T00:00:00") >= cutoff));
+  const keep = (m) => Object.fromEntries(Object.entries(m || {}).filter(([d]) => !cutoff || new Date(d.split("|").pop() + "T00:00:00") >= cutoff));
   return {
     v: 1,
     rows: customRows.map((r) => ({ id: r.id, name: r.name, sign: r.sign, vals: keep(r.vals) })),
@@ -1748,6 +1801,36 @@ async function addDetailSheets(dst, r) {
         links.disposal = (L) => sumifs(name, colRange(4, t.first, t.last), colRange(5, t.first, t.last), L);
       }
     } catch (e) { notes.push("Unit Disposals sheet not added: " + e.message); }
+  }
+
+  // Cash In file: a sheet for Loan Proceeds and one for Advances from Affiliates, each with a "Summary week" column
+  if (Object.keys(state.ci.byDate).length) {
+    const s = state.ci;
+    if (s.buffer) {
+      try {
+        const swb = sjs("ci"), res = parseCashIn(swb);
+        for (const x of res.loc.sheets) {
+          const name = CI_ROWS[x.key], sw = swb.Sheets[x.sheet], rg = XLSX.utils.decode_range(sw["!ref"] || "A1");
+          const ws = await sourceSheet(dst, "ci", sw, x.sheet, name, notes), W = rg.e.c + 2, hdr = x.hdr + 1;
+          addHead(ws, hdr, W, "Summary week (Monday)", 14);
+          let first = Infinity, last = 0;
+          for (const ln of x.lines) {
+            const row = ln.r + 1; first = Math.min(first, row); last = Math.max(last, row);
+            addCell(ws, row, W, !ln.ours ? "Not counted (not to ECIHI)" : ln.date ? mondayOf(ln.date) : "No date");
+          }
+          if (last) links[x.key] = (L) => sumifs(name, colRange(x.cAmt + 1, first, last), colRange(W, first, last), L);
+        }
+      } catch (e) { notes.push("Cash In sheets not added: " + e.message); }
+    } else {
+      for (const [key, name] of Object.entries(CI_ROWS)) {
+        const m = srcDates("ci|" + key), days = Object.keys(m).sort();
+        if (!days.length) continue;
+        const t = tableSheet(dst, name, `${name} — kept in the last saved summary${s.savedFrom ? ` (${s.savedFrom})` : ""}`,
+          [["Date", 12], ["Amount", 16], ["Summary week (Monday)", 14]],
+          days.map((d) => { const dt = new Date(d + "T00:00:00"); return [dt, m[d], mondayOf(dt)]; }));
+        links[key] = (L) => sumifs(name, colRange(2, t.first, t.last), colRange(3, t.first, t.last), L);
+      }
+    }
   }
 
   // Cash Out: one sheet per file (amounts are cash going out: the Summary shows them negative)
@@ -2006,15 +2089,15 @@ async function finalizeWeek() {
 /* ============================================================
    Several people, one shared cashflow (LAN folder FILES)
    FILES/Current/ holds the latest version of every part, each saved separately:
-     part-<ar|cf|ds|ln|uc|po|un>.json (+ <k>-file.<ext>)  source files with their edits
+     part-<ar|cf|ds|ln|uc|po|un|ci>.json (+ <k>-file.<ext>)  source files with their edits
      part-bank.json   bank balances (Beginning Balance of Week 1)
      part-typed.json  typed amounts / added rows, cell by cell, with who typed them
    Opening the system loads all parts. Save re-reads them, writes only the parts you changed, and rebuilds
    Cashflow_Summary_LATEST.xlsx from everyone's latest work. "Finalize week" keeps a dated copy.
    ============================================================ */
 const CURRENT_DIR = "Current", LATEST_NAME = "Cashflow_Summary_LATEST.xlsx", SAVE_LOCK = "_saving.json";
-var SHARED_KINDS = ["ar", "cf", "ds", "ln", "uc", "po", "un"];
-const PART_LABEL = { ar: "AR Aging", cf: "Cash Flow Report", ds: "Unit Disposals", ln: "Loan Payment Schedule", uc: "Unreleased Checks", po: "Projected Cash Outflow", un: "Unidentified Collection", bank: "Bank balances", typed: "Typed amounts / added rows" };
+var SHARED_KINDS = ["ar", "cf", "ds", "ln", "uc", "po", "un", "ci"];
+const PART_LABEL = { ar: "AR Aging", cf: "Cash Flow Report", ds: "Unit Disposals", ln: "Loan Payment Schedule", uc: "Unreleased Checks", po: "Projected Cash Outflow", un: "Unidentified Collection", ci: "Cash In (Loan Proceeds / Advances)", bank: "Bank balances", typed: "Typed amounts / added rows" };
 const SESSION_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
 var sharedLoading = false;      // true while parts from FILES/Current are being read (not a change by this user)
 var sharedFound = false;        // FILES/Current had parts when the page connected
@@ -2123,7 +2206,7 @@ function adoptTyped(R) {
 }
 
 // ---- one source part
-const INGEST = { ar: (f) => handleFile("ar", f), cf: (f) => handleCashflowReport(f), ds: (f) => handleDisposal(f), ln: (f) => handleCashOut("ln", f), uc: (f) => handleCashOut("uc", f), po: (f) => handleCashOut("po", f), un: (f) => handleCashOut("un", f) };
+const INGEST = { ar: (f) => handleFile("ar", f), cf: (f) => handleCashflowReport(f), ds: (f) => handleDisposal(f), ln: (f) => handleCashOut("ln", f), uc: (f) => handleCashOut("uc", f), po: (f) => handleCashOut("po", f), un: (f) => handleCashOut("un", f), ci: (f) => handleCashOut("ci", f) };
 function clearPart(k) {
   const s = state[k];
   if (k === "ds") Object.assign(s, { rows: [], file: null, buffer: null, from: "" });
@@ -2393,14 +2476,14 @@ restoreFolder();
      those edits live in the saved summary only.
    ============================================================ */
 const FILE_KINDS = [
-  ["ar", "AR Aging"], ["un", "Unidentified Collection"], ["ap", "AP Aging"], ["cf", "Cash Flow Report"], ["ds", "Unit Disposals"],
+  ["ar", "AR Aging"], ["un", "Unidentified Collection"], ["ci", "Cash In (Loan Proceeds / Advances)"], ["ap", "AP Aging"], ["cf", "Cash Flow Report"], ["ds", "Unit Disposals"],
   ["ln", "Loan Payment Schedule"], ["uc", "Unreleased Checks"], ["po", "Projected Cash Outflow"],
 ];
 const KIND_NAME = Object.fromEntries(FILE_KINDS);
 const startWork = () => {};      // V3.6: no "in use" lock — everyone can work at the same time
 const DISPATCH = {
   ar: (f) => (startWork(), handleFile("ar", f)), ap: (f) => (startWork(), handleFile("ap", f)), cf: (f) => (startWork(), handleCashflowReport(f)), ds: (f) => (startWork(), handleDisposal(f)),
-  ln: (f) => (startWork(), handleCashOut("ln", f)), uc: (f) => (startWork(), handleCashOut("uc", f)), po: (f) => (startWork(), handleCashOut("po", f)), un: (f) => (startWork(), handleCashOut("un", f)),
+  ln: (f) => (startWork(), handleCashOut("ln", f)), uc: (f) => (startWork(), handleCashOut("uc", f)), po: (f) => (startWork(), handleCashOut("po", f)), un: (f) => (startWork(), handleCashOut("un", f)), ci: (f) => (startWork(), handleCashOut("ci", f)),
 };
 function resetFileEdits(k) { Object.assign(state[k], { edits: {}, wbEdit: null, written: {}, backedUp: false, remEdited: {}, recalc: {}, ops: [], copySaved: false }); }
 const hasOriginal = (k) => !!(state[k].buffer);
@@ -2523,7 +2606,7 @@ function openEditor(k) {
   if (rem) { fe.sheet = null; $("fe-tabs").innerHTML = ""; }
   else {
     const wb = editWorkbook(k);
-    const preferred = { ar: /^detail$/i, ap: /^detail$/i, cf: /^summary$/i, ds: /weekly/i, ln: /^detail$/i, uc: /unreleased/i, po: /./, un: /./ }[k];
+    const preferred = { ar: /^detail$/i, ap: /^detail$/i, cf: /^summary$/i, ds: /weekly/i, ln: /^detail$/i, uc: /unreleased/i, po: /./, un: /./, ci: /loan/i }[k];
     fe.sheet = wb.SheetNames.find((n) => preferred.test(n)) || wb.SheetNames[0];
     renderFeTabs();
   }
@@ -2565,15 +2648,16 @@ function dispVal(v, yearCol, plain) {
   return v.toLocaleString("en-PH", { maximumFractionDigits: 6 });
 }                                   // value as shown = value used by the filter
 // Summary row fed by each file; typed amounts on that row (Edit mode / carried from the last save) hide file changes
-const KIND_ROW = { ar: ["arCorp", "AR Corporate"], cf: ["retail", "Retail (Credit Card)"], ds: ["disposal", "Proceeds from Disposal"], ln: ["loans", "Loan payments"], uc: ["checks", "Unreleased checks"], po: ["projout", "Projected payments"], un: ["unident", "Unidentified Collection"] };
+const KIND_ROW = { ar: ["arCorp", "AR Corporate"], cf: ["retail", "Retail (Credit Card)"], ds: ["disposal", "Proceeds from Disposal"], ln: ["loans", "Loan payments"], uc: ["checks", "Unreleased checks"], po: ["projout", "Projected payments"], un: ["unident", "Unidentified Collection"], ci: [["loan", "Loan Proceeds"], ["affiliate", "Advances from Affiliates"]] };
 function renderOverrideWarning() {
-  const box = $("fe-warn"), kr = KIND_ROW[fe.k], ov = kr && overrides[kr[0]];
-  const ws = ov && report ? report.wk.filter((w) => ov[toISO(w.start)] !== undefined) : [];
-  if (!ws.length) { box.classList.add("hidden"); return; }
-  box.innerHTML = `⚠ The Summary row <b>${kr[1]}</b> has amounts typed by hand in ${ws.length} week(s) (${ws.map((w) => "Week " + w.n).join(", ")}). Typed amounts win over the file, so your changes here do not show in those weeks.
+  const box = $("fe-warn"), k0 = KIND_ROW[fe.k], krs = !k0 ? [] : Array.isArray(k0[0]) ? k0 : [k0];   // a file can feed several rows
+  const hit = krs.map((kr) => ({ kr, ws: overrides[kr[0]] && report ? report.wk.filter((w) => overrides[kr[0]][toISO(w.start)] !== undefined) : [] })).filter((x) => x.ws.length);
+  if (!hit.length) { box.classList.add("hidden"); return; }
+  const names = hit.map((x) => x.kr[1]).join(" / ");
+  box.innerHTML = `⚠ ${hit.map((x) => `The Summary row <b>${x.kr[1]}</b> has amounts typed by hand in ${x.ws.length} week(s) (${x.ws.map((w) => "Week " + w.n).join(", ")}).`).join(" ")} Typed amounts win over the file, so your changes here do not show in those weeks.
     <button type="button" class="btn small" id="fe-unov">Use the file values instead</button>`;
   box.classList.remove("hidden");
-  $("fe-unov").onclick = () => { delete overrides[kr[0]]; saved = false; refresh(); renderOverrideWarning(); toast(`Typed amounts removed from ${kr[1]} — the Summary now follows the file.`); };
+  $("fe-unov").onclick = () => { hit.forEach((x) => delete overrides[x.kr[0]]); saved = false; refresh(); renderOverrideWarning(); toast(`Typed amounts removed from ${names} — the Summary now follows the file.`); };
 }
 function renderEditor() {
   renderOverrideWarning();
@@ -3206,7 +3290,7 @@ function renderRememberedEditor() {
   } else {
     const ds = Object.keys(s.byDate).sort();
     head = "<tr><th>Date</th><th>Amount</th></tr>";
-    body = ds.map((d) => `<tr><td class="l">${d}</td><td class="fe-c num${re[d] ? " edited" : ""}" data-rem="${d}">${showVal(s.byDate[d])}</td></tr>`).join("");
+    body = ds.map((d) => `<tr><td class="l">${d.includes("|") ? (CI_ROWS[d.split("|")[0]] || d.split("|")[0]) + " · " + d.split("|")[1] : d}</td><td class="fe-c num${re[d] ? " edited" : ""}" data-rem="${d}">${showVal(s.byDate[d])}</td></tr>`).join("");
   }
   $("fe-grid").innerHTML = `<table class="rem"><thead>${head}</thead><tbody>${body}</tbody></table>`;
   $("fe-note").textContent = `${editCount(k)} edited value(s). Kept in the saved summary only (no original file this session).`;

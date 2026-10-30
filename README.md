@@ -17,3 +17,5 @@ Everyone connects the same shared **FILES** folder on the LAN. Each part (AR Agi
 ## V3.7
 - **Unidentified Collection**: a Cash In row under AR Corporate, with its own upload slot under AR Aging. The file has a Date and an Amount column (actual collections); each amount goes into the week of its date, full amount (no EWT).
 - **Reference Folder**: Save summary also updates the source file of the same name in `FILES/Reference Folder` (for every user), after keeping a "(before edit)" backup in Uploaded Files. If the file is open in Excel, the system asks you to close it; an update that could not be written is retried on the next Save summary.
+- **Cash In file** (upload slot under Unidentified Collection): sheet "Loan Proceeds" fills the Loan Proceeds row; sheet "Advances from Affiliates" fills the Advances from Affiliates row (amount after the DEBIT column, only lines going TO ECIHI). Amounts go into the week of their date.
+- On a Mac, use Google Chrome or Microsoft Edge (Safari, Firefox and iPhone/iPad cannot save into folders).
